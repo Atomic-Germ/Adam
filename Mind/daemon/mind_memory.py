@@ -476,6 +476,23 @@ class MindMemory:
             self.save()
         return len(self._records)
 
+    def add_dream(self, summary: str) -> int:
+        """Store a previous dream in the same mental space as everything else."""
+        if not (summary or "").strip():
+            return 0
+        return self.add_chunked(summary, source="mind", kind="dream")
+
+    def has_dream(self) -> bool:
+        return any(r.get("kind") == "dream" for r in self._records)
+
+    def instruction_texts(self) -> list[str]:
+        """The seeded instruction records (the mind's first memory)."""
+        return [
+            r.get("text", "")
+            for r in self._records
+            if r.get("kind") == "instruction" and (r.get("text") or "")
+        ]
+
     # ------------------------------------------------------------------
     # Seeding
     # ------------------------------------------------------------------

@@ -19,12 +19,18 @@ This slice carries only:
   Cathedral-shaped (`memory.json` records + `embeddings.npy` matrix); the
   embedder defaults to Arthur's deterministic hashing bag-of-words and can
   switch to sentence-transformers.
+- **dream / sleep** — context-pressure driven, not scheduled. Crossing a
+  context-window threshold (clamped to 60–75%) triggers a dream: a direct
+  replay/compaction of the window (keep what is interesting, newly learned,
+  or repeated; drop the rest), embedded into long-term memory, then waking
+  to a fresh empty context window that opens on nothing but the dream
+  summary. The very first dream dreams the initial first memory.
 - **wiring** — model-initiated nudges (a `nudge` idle trigger + clock tick),
   streamed over the OpenAI-compatible SSE contract.
 
 Still deliberately omitted (later slices): scratch/working-notes, the
-self-prompt revision protocol, summarization, dream/nap/slow-wave night
-cycle, and memory-selection beyond the relevance filter.
+self-prompt revision protocol, nap and the slow-wave night cycle, and
+memory-selection beyond the relevance filter.
 
 ## Layout
 
@@ -45,6 +51,7 @@ Mind/
   tests/
     conftest.py
     test_dbus_methods.py
+    test_dream.py
     test_lifecycle.py
     test_memory.py
 ```
@@ -115,6 +122,35 @@ Env knobs (all `MIND_`-prefixed):
 The hash backend is deterministic and needs only numpy; `st` mirrors
 Arthur/Cathedral (`all-MiniLM-L6-v2`) and falls back to hash if the model
 cannot load.
+
+## Dream / sleep (context-pressure driven)
+
+The mind does not schedule its own sleep and is not asked when it is tired —
+a child does not know. Instead a simple threshold on the context window
+(clamped to 60–75%) triggers a dream pass, exactly like context compaction
+in a coding harness:
+
+1. **Replay** — the whole context window is given back to the model,
+   verbatim, with instructions to keep what is interesting, newly learned,
+   or repeated and drop the rest.
+2. **Compress** — the model writes a compact dream summary (non-streaming).
+3. **Embed** — the summary is stored into the same long-term memory space as
+   everything else (`kind="dream"`), so a later RAG pass can re-ground it.
+4. **Wake** — the context history is wiped. The fresh context window opens on
+   nothing but the dream summary (`--- Dream recall ---`); identity comes
+   back from long-term memory after, like a person waking up not knowing
+   where they are until they check.
+
+The first thing the occupant model ever experiences is a dream of its first
+memory: on a store that has never slept, the daemon dreams the seeded
+instructions before any conversation happens.
+
+Sleep env knobs:
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `MIND_SLEEP_CTX_PCT` | `70` | context-pressure threshold (clamped to 60–75) |
+| `MIND_SLEEP_MIN_TURNS` | `6` | minimum history turns before a dream may fire |
 
 ## Run the tests
 
