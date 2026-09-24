@@ -1,0 +1,21 @@
+[Unit]
+Description=Mind daemon — MX service for the Mind body
+Documentation=file://%h/.local/lib/mind/README.md
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/mind/mind-daemon.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# The daemon is wired to the local patched llama.cpp OpenAI-compatible server.
+# Default: http://127.0.0.1:9999. Override with MIND_LLM_URL below.
+# PassEnvironment=MIND_LLM_URL=http://127.0.0.1:9999
+# Identity/values framing sent as the system role (takes effect immediately).
+# PassEnvironment=MIND_SYSTEM_PROMPT=
+
+[Install]
+WantedBy=graphical-session.target

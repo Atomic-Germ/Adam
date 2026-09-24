@@ -1,0 +1,195 @@
+/* =========================================================================
+   Mind — stylesheet.css
+   ========================================================================= */
+
+/* ── Outer window ────────────────────────────────────────────────────────── */
+.mind-window {
+    background-color: rgba(14, 14, 20, 0.97);
+    border-radius:    16px;
+    border:           1px solid rgba(255, 255, 255, 0.10);
+    box-shadow:       0 24px 64px rgba(0, 0, 0, 0.72);
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+.mind-header {
+    padding:       10px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    spacing:       6px;
+}
+
+.mind-title {
+    font-size:   13px;
+    font-weight: bold;
+    color:       rgba(255, 255, 255, 0.85);
+}
+
+.mind-status {
+    spacing:       4px;
+    padding:       4px 9px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.05);
+    margin-right:  4px;
+}
+
+.mind-status-dot {
+    font-size: 11px;
+    margin-top: 1px;
+}
+
+.mind-status-label {
+    font-size:   11px;
+    font-weight: bold;
+}
+
+.mind-status-hanging-out,
+.mind-status-idle {
+    color: rgba(165, 173, 199, 0.90);
+}
+
+.mind-status-chatting {
+    color: rgba(114, 225, 191, 0.95);
+}
+
+.mind-status-napping {
+    color: rgba(243, 191, 99, 0.95);
+}
+
+.mind-status-sleeping {
+    color: rgba(132, 154, 255, 0.96);
+}
+
+.mind-proposal {
+    spacing:       4px;
+    padding:       4px 9px;
+    border-radius: 999px;
+    background-color: rgba(245, 179, 74, 0.12);
+    border: 1px solid rgba(245, 179, 74, 0.25);
+    margin-right:  2px;
+}
+
+.mind-proposal-label {
+    font-size:   11px;
+    font-weight: bold;
+    color: rgba(245, 199, 120, 0.95);
+}
+
+.mind-proposal-btn {
+    padding: 3px 6px;
+}
+
+.mind-icon-btn {
+    background-color: transparent;
+    border:           none;
+    color:            rgba(255, 255, 255, 0.40);
+    border-radius:    6px;
+    padding:          3px 7px;
+    font-size:        13px;
+}
+
+.mind-icon-btn:hover {
+    background-color: rgba(255, 255, 255, 0.09);
+    color:            rgba(255, 255, 255, 0.80);
+}
+
+/* ── Scroll area ─────────────────────────────────────────────────────────── */
+.mind-scroll {
+    padding: 4px 0;
+}
+
+.mind-msgs {
+    padding: 10px 12px;
+    spacing: 8px;
+}
+
+/* ── Message bubbles ─────────────────────────────────────────────────────── */
+.mind-msg {
+    font-size:     13px;
+    padding:       10px 14px;
+    border-radius: 14px;
+    max-width:     360px;
+}
+
+.mind-msg-user {
+    background-color: rgba(99, 102, 241, 0.85);
+    color:            rgba(255, 255, 255, 0.96);
+    border-radius:    14px 14px 4px 14px;
+}
+
+.mind-msg-assistant {
+    background-color: rgba(40, 40, 52, 0.92);
+    color:            rgba(230, 230, 240, 0.92);
+    border-radius:    6px 6px 6px 4px;
+}
+
+.mind-error {
+    color: rgba(255, 110, 110, 0.95) !important;
+}
+
+/* ── Input bar ───────────────────────────────────────────────────────────── */
+.mind-input-row {
+    padding:       10px 12px;
+    border-top:    1px solid rgba(255, 255, 255, 0.07);
+    spacing:       8px;
+}
+
+.mind-entry {
+    background-color: rgba(255, 255, 255, 0.06);
+    border:           1px solid rgba(255, 255, 255, 0.11);
+    border-radius:    10px;
+    color:            rgba(255, 255, 255, 0.90);
+    padding:          8px 12px;
+    font-size:        13px;
+    caret-color:      rgba(99, 102, 241, 0.9);
+}
+
+.mind-entry:focus {
+    border-color:     rgba(99, 102, 241, 0.55);
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.mind-send-btn {
+    background-color: rgba(99, 102, 241, 0.90);
+    color:            white;
+    border-radius:    10px;
+    width:            36px;
+    height:           36px;
+    font-size:        16px;
+    border:           none;
+    font-weight:      bold;
+}
+
+.mind-send-btn:hover {
+    background-color: rgba(99, 102, 241, 1.00);
+}
+
+.mind-send-btn:insensitive {
+    background-color: rgba(99, 102, 241, 0.35);
+    color:            rgba(255, 255, 255, 0.45);
+}
+
+/* ── Thinking section ────────────────────────────────────────────────────── */
+.mind-think-toggle {
+    background-color: transparent;
+    border:           none;
+    color:            rgba(160, 160, 185, 0.45);
+    font-size:        11px;
+    padding:          0 0 3px 0;
+    text-align:       left;
+}
+
+.mind-think-toggle:hover {
+    color: rgba(160, 160, 185, 0.80);
+}
+
+.mind-think {
+    color:            rgba(160, 160, 185, 0.55);
+    font-size:        11px;
+    background-color: rgba(255, 255, 255, 0.03);
+    border-radius:    6px;
+    padding:          5px 8px;
+    margin-bottom:    6px;
+}
+
+/* ── Inline / block code (Pango <tt> inside assistant label) ─────────────── */
+/* St.Label does not expose tt{} as a CSS selector; colour is set inline      */
+/* via the Pango span foreground="#8fbcbb". This comment is a breadcrumb.     */
