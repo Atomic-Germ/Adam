@@ -1,3 +1,15 @@
 [submodule "llama.cpp"]
 	path = llama.cpp
 	url = https://github.com/ggml-org/llama.cpp
+[submodule "Arthur"]
+	path = Arthur
+	url = ./Arthur
+[submodule "Bubble"]
+	path = Bubble
+	url = ./Bubble
+[submodule "Cathedral"]
+	path = Cathedral
+	url = ./Cathedral
+[submodule "BridgePhenomenon"]
+	path = BridgePhenomenon
+	url = ./BridgePhenomenon
