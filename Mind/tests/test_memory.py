@@ -151,6 +151,77 @@ class TestSelection:
         assert mem.build_memory_block("anything") is None
 
 
+class TestFuzzyRecall:
+    def test_default_fuzzy_enabled(self, mem):
+        assert mem.fuzzy is True
+
+    def test_seed_override_deterministic(self, mem, monkeypatch):
+        monkeypatch.setenv("MIND_MEMORY_FUZZY", "1")
+        monkeypatch.setenv("MIND_MEMORY_FUZZY_SEED", "1234")
+        mem.fuzzy = True
+        mem.fuzzy_seed = "1234"
+        for i in range(12):
+            mem.add_chunked(f"project note number {i} about geometry", source="user")
+        mem.save()
+        a = mem.select("project geometry", top_k=6)
+        b = mem.select("project geometry", top_k=6)
+        assert [r["id"] for r in a] == [r["id"] for r in b]
+
+    def test_seed_material_varies_by_seed(self, mem, monkeypatch):
+        mem.fuzzy = True
+        mem.fuzzy_temp = 10.0
+        for i in range(12):
+            mem.add_chunked(f"project note number {i} about geometry", source="user")
+        mem.save()
+        mem.fuzzy_seed = "1"
+        s1 = mem._live_seed("geometry notes")
+        mem.fuzzy_seed = "2"
+        s2 = mem._live_seed("geometry notes")
+        assert s1 != s2
+
+    def test_anchor_core_survives_fuzz(self, mem):
+        mem.fuzzy = True
+        mem.fuzzy_seed = "777"
+        mem.add_chunked("the user prefers quiet evenings alone", source="user")
+        for i in range(10):
+            mem.add_chunked(f"unrelated footnote text number {i}", source="mind")
+        mem.save()
+        top = mem.select("what does the user prefer?", top_k=6)
+        assert any("quiet evenings" in r["text"] for r in top)
+        assert len(top) >= 1
+
+    def test_fuzzy_draws_from_matched_not_noise(self, mem):
+        mem.fuzzy = True
+        mem.fuzzy_temp = 8.0
+        mem.fuzzy_seed = "42"
+        mem.add_chunked("the user prefers quiet evenings alone", source="user")
+        mem.add_chunked("another related thought about quiet preference", source="user")
+        for i in range(10):
+            mem.add_chunked(f"unrelated footnote text number {i}", source="mind")
+        mem.save()
+        top = mem.select("what does the user prefer?", top_k=6)
+        assert all(
+            "quiet" in r["text"] or "prefer" in r["text"] for r in top
+        )
+
+    def test_fuzzy_window_not_always_top_k(self, mem):
+        mem.fuzzy = True
+        mem.fuzzy_temp = 8.0
+        mem.fuzzy_seed = "42"
+        for i in range(12):
+            mem.add_chunked(f"geometry shape number {i}", source="user")
+        mem.save()
+        strict = [r["id"] for r in mem.select("geometry", top_k=6)]
+        assert len(strict) == 6
+
+    def test_build_memory_block_has_no_selection_metadata(self, mem):
+        mem.add_chunked("the user prefers quiet evenings alone", source="user")
+        block = mem.build_memory_block("user preferences")
+        assert "Showing" not in block
+        assert "relevance-filtered" not in block
+        assert "of 1 memory nodes" not in block
+
+
 # ---------------------------------------------------------------------------
 # Daemon wiring
 # ---------------------------------------------------------------------------

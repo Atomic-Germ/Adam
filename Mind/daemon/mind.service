@@ -20,6 +20,12 @@ Environment=MIND_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
 Environment=MIND_MEMORY_TOP_K=4
 Environment=MIND_MEMORY_CHUNK_SIZE=512
 Environment=MIND_MEMORY_CHUNK_OVERLAP=80
+# Fuzzy recall is on by default: the memory surfaces deliberately
+# approximate — some slots are temperature-sampled from the embedding space
+# and near-seed "shape" hops, seeded from live GPU temps + model/context
+# hashes so a similar situation resurfaces a similar (never identical) set.
+# Set MIND_MEMORY_FUZZY=0 to go back to strict relevance top-k.
+Environment=MIND_MEMORY_FUZZY=1
 
 PassEnvironment=MIND_MODEL 
 # Identity/values framing sent as the system role (takes effect immediately).

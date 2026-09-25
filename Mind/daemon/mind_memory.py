@@ -23,11 +23,14 @@ selection falls back to lexical + recency only.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
+import random
 import re
 import shutil
 import tempfile
@@ -69,6 +72,17 @@ def _int_env(key: str, default: int, lo: int, hi: int) -> int:
         v = int(raw)
         if lo <= v <= hi:
             return v
+    return default
+
+
+def _float_env(key: str, default: float, lo: float, hi: float) -> float:
+    raw = os.environ.get(key, "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    if lo <= v <= hi:
+        return v
     return default
 
 
@@ -226,6 +240,10 @@ class MindMemory:
             "MIND_MEMORY_CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP, 0, 1024,
         )
         self.sync_index = _getenv_bool("MIND_MEMORY_SYNC_INDEX", False)
+        self.fuzzy = _getenv_bool("MIND_MEMORY_FUZZY", True)
+        self.fuzzy_temp = _float_env("MIND_MEMORY_FUZZY_TEMP", 2.0, 0.1, 10.0)
+        self.fuzzy_hops = _int_env("MIND_MEMORY_FUZZY_HOPS", 1, 0, 4)
+        self.fuzzy_seed = os.environ.get("MIND_MEMORY_FUZZY_SEED", "").strip()
 
         self._lock = threading.RLock()
         self._embedder = None
@@ -542,6 +560,16 @@ class MindMemory:
         return terms
 
     def select(self, query: str, extra: str = "", top_k: Optional[int] = None) -> list[dict]:
+        """Surfaced memory for a query.
+
+        The anchor core (a large share of the slots) is the direct, relevant
+        match. The remaining slots are deliberately fuzzy: temperature-weighted
+        sampling over the embedding space with a live seed (GPU temperature,
+        model hash, context hash, a coarse time bucket), plus near-seed hops so
+        tangential-but-true connections can come to the mind. The seed is not
+        broadly reproducible: a similar situation tends to surface a similar
+        set — never the exact same one, deliberately.
+        """
         records = self._records
         if not records:
             return []
@@ -587,30 +615,140 @@ class MindMemory:
             scored.append((score, semantic, -idx, rec))
 
         scored.sort(reverse=True)
-        selected = [rec for score, _sem, _neg_idx, rec in scored if score > 0][:k]
-        if not selected:
+        matched = [tup for tup in scored if tup[0] > 0]
+        if not matched:
             # Default to recency ordering when nothing matched lexically.
-            selected = [rec for _s, _sem, _neg_idx, rec in scored[:k]]
-        return selected
+            return [rec for _s, _sem, _neg_idx, rec in scored[:k]]
+
+        if not self.fuzzy or k <= 1:
+            return [rec for _s, _sem, _neg_idx, rec in matched[:k]]
+
+        # Anchor core: the direct connection is not left to chance.
+        anchor_n = max(1, int(k * 0.6))
+        core = matched[:anchor_n]
+        pool = matched[anchor_n:]
+        if not pool:
+            return [rec for _s, _sem, _neg_idx, rec in core[:k]]
+
+        rng = random.Random(self._live_seed(query, extra))
+        slots = k - len(core)
+        picks: list[tuple[float, float, int, dict]] = []
+        remaining = [t for t in pool if t[2] not in {t[2] for t in core}]
+        for _ in range(slots):
+            if not remaining:
+                break
+            max_score = max(t[0] for t in remaining) or 1.0
+            weights = [
+                math.exp((t[0] - max_score) / self.fuzzy_temp)
+                for t in remaining
+            ]
+            total = sum(weights) or 1.0
+            roll = rng.random() * total
+            acc = 0.0
+            stop = 0
+            for i, w in enumerate(weights):
+                acc += w
+                if acc >= roll:
+                    stop = i
+                    break
+            picks.append(remaining.pop(stop))
+
+        # Near-seed geometric hops: pull in a tangential-but-true neighbor of
+        # a surfaced node from the embedding space (the shape of the memory).
+        hops = 0
+        try:
+            while hops < self.fuzzy_hops and picks:
+                t = picks[hops] if hops < len(picks) else picks[-1]
+                pos = -t[2]
+                nidx = self._nearest_embedding(
+                    pos, {(-p[2]) for p in core} | {(-p[2]) for p in picks}
+                )
+                if nidx is None:
+                    break
+                picks[hops] = (t[0] * 0.5, 0.0, -nidx, records[nidx])
+                hops += 1
+        except Exception:  # noqa: BLE001
+            pass
+
+        selected = core + picks
+        selected.sort(reverse=True)
+        return [rec for _s, _sem, _neg_idx, rec in selected[:k]]
+
+    def _nearest_embedding(self, idx: int, exclude: set[int]) -> Optional[int]:
+        """Nearest memory node (by cosine) not already surfaced; the shape hop."""
+        if self._matrix_np is None or self._matrix_np.shape[0] != len(self._records):
+            return None
+        row = self._matrix_np[idx]
+        best: Optional[int] = None
+        best_sim = 0.35
+        for j in range(len(self._records)):
+            if j == idx or j in exclude:
+                continue
+            rj = self._matrix_np[j]
+            denom = (float(np.linalg.norm(rj)) * float(np.linalg.norm(row))) or 1.0
+            sim = float(np.dot(rj, row)) / denom
+            if sim > best_sim:
+                best_sim = sim
+                best = j
+        return best
+
+    def _live_seed(self, query: str, extra: str = "") -> int:
+        """A seed that is *mostly* contextual but never deliberately fixed.
+
+        Similar situations feed similar material (model, query, coarse time
+        bucket, GPU temperature) into the same hash, so a related memory tends
+        to resurface — but the exact draw is not reproducible on purpose.
+        An explicit MIND_MEMORY_FUZZY_SEED overrides for tests.
+        """
+        if self.fuzzy_seed:
+            try:
+                return int(self.fuzzy_seed, 0)
+            except ValueError:
+                pass
+        temps = "|".join(self._read_gpu_temps()) or "?"
+        material = "|".join([
+            temps,
+            self.model,
+            self.backend,
+            hashlib.sha256((query + "\n" + extra).encode("utf-8", "ignore")).hexdigest(),
+            str(int(time.time()) // 300),
+        ])
+        digest = hashlib.blake2b(material.encode("utf-8", "ignore"), digest_size=8)
+        return int.from_bytes(digest.digest(), "little")
+
+    @staticmethod
+    def _read_gpu_temps() -> list[str]:
+        """Live GPU package temperatures (AMD hwmon); best-effort on a battery."""
+        temps: list[str] = []
+        try:
+            for path in glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*/temp*_input"):
+                with open(path, "r", encoding="utf-8") as fh:
+                    temps.append(fh.read().strip())
+            if not temps:
+                for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+                    with open(path, "r", encoding="utf-8") as fh:
+                        temps.append(fh.read().strip())
+        except Exception:  # noqa: BLE001
+            pass
+        return temps[:4]
 
     def build_memory_block(
         self, query: str = "", extra: str = "", top_k: Optional[int] = None
     ) -> Optional[str]:
-        """Relevance-filtered memory block for the system prompt."""
+        """Surfaced memory block for the system prompt.
+
+        The selection machinery never enters the context window: no "we looked
+        up N nodes and filtered to K" framing, no relevance counts. The block
+        simply presents what came to mind — the model does the judgment of
+        what holds.
+        """
         records = self._records
         if not records:
             return None
         selected = self.select(query, extra, top_k=top_k)
         if not selected:
             return None
-        hidden = max(0, len(records) - len(selected))
         lines = ["--- Memory ---"]
-        total = len(records)
-        if hidden > 0:
-            lines.append(
-                f"Showing {len(selected)} of {total} memory nodes "
-                "(relevance-filtered)."
-            )
         for rec in selected:
             source = _SOURCE_LABELS.get(rec.get("source", ""), "unknown")
             text = rec.get("text", "").strip().replace("\n", " ").strip()

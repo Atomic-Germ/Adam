@@ -101,10 +101,17 @@ What lands in the store:
 - **Experience** — every finished user↔mind exchange is chunked into the
   store as `user` / `mind` experience in the background.
 
-Every `SendMessage` asks the store for the most relevant nodes to the current
-message (semantic similarity first, plus lexical and recency signals) and
-injects them into the system content as a `--- Memory ---` block. Embeddings
-are the key: without them retrieval degrades to lexical + recency only.
+Every `SendMessage` asks the store to *surface* memory for the current
+message: a deterministic anchor core of the most relevant nodes (semantic
+first, plus lexical and recency), then deliberately fuzzy slots. The fuzzy
+slots are temperature-weighted samples drawn from the embedding space plus
+near-seed "shape" hops (a tangential-but-true neighbor of a surfaced node,
+the geometry of the memory store). The sampling seed is live — a hash of GPU
+package temperature, the embedder model, the content hash and a coarse time
+bucket — so a similar situation resurfaces a similar set but never the exact
+same one, on purpose. The selection machinery never enters the context
+window: the `--- Memory ---` block is presented plainly and the model is
+left to judge which surfaced recollections hold.
 
 Env knobs (all `MIND_`-prefixed):
 
@@ -114,10 +121,14 @@ Env knobs (all `MIND_`-prefixed):
 | `MIND_MEMORY_SEED_DIR` | `<dir>/original_memory` | seed instructions |
 | `MIND_EMBED_BACKEND` | `hash` | `hash` (pure numpy bag-of-words) · `st` (sentence-transformers) · `off` |
 | `MIND_EMBED_MODEL` | `all-MiniLM-L6-v2` | model when `MIND_EMBED_BACKEND=st` |
-| `MIND_MEMORY_TOP_K` | `6` | memory nodes surfaced per prompt |
+| `MIND_MEMORY_TOP_K` | `6` | memory notes surfaced per prompt |
 | `MIND_MEMORY_CHUNK_SIZE` | `500` | Arthur chunk size |
 | `MIND_MEMORY_CHUNK_OVERLAP` | `80` | Arthur chunk overlap |
 | `MIND_MEMORY_SYNC_INDEX` | `0` | index synchronously (tests) |
+| `MIND_MEMORY_FUZZY` | `1` | fuzzy recall on; `0` disables (strict relevance top-k) |
+| `MIND_MEMORY_FUZZY_TEMP` | `2.0` | sampling temperature; higher → more tangential slots |
+| `MIND_MEMORY_FUZZY_HOPS` | `1` | near-seed "shape" hops to pull in tangent neighbors (0-4) |
+| `MIND_MEMORY_FUZZY_SEED` | *(live)* | explicit seed override (tests / reproducibility) |
 
 The hash backend is deterministic and needs only numpy; `st` mirrors
 Arthur/Cathedral (`all-MiniLM-L6-v2`) and falls back to hash if the model
