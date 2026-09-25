@@ -8,6 +8,7 @@ window. The dream is embedded into long-term memory, history is wiped, and the
 fresh context window opens on nothing but the dream summary.
 """
 
+import threading
 import time
 from unittest import mock
 
@@ -152,3 +153,35 @@ class TestDreamBlockInContext:
         daemon.SetSystemPrompt("mind")
         content = daemon._build_system_content()
         assert "Dream recall" not in content
+
+    def test_lock_is_reentrant_build_system_content(self, daemon):
+        # Regression: _stream/_clock_tick hold _lock while building the system
+        # content, which re-acquires the same lock (dream recall + telemetry).
+        # A plain threading.Lock deadlocks the main GLib thread, freezing all
+        # D-Bus traffic. The daemon lock must be reentrant.
+        daemon._dream_summary = "reentrant dream"
+        daemon.SetSystemPrompt("mind")
+        with daemon._lock:  # exactly what _stream() does before _build_system_content
+            content = daemon._build_system_content()
+        assert "--- Dream recall ---" in content
+
+    def test_send_message_runs_stream_off_main_thread(self, daemon):
+        # Regression: SendMessage must hand the stream to a background thread;
+        # if it ran _stream inline on the GLib main loop, the blocking HTTP
+        # call would freeze D-Bus dispatch and signal emission for the entire
+        # (minutes-long) generation.
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_stream(*_a, **_k):
+            entered.set()
+            release.wait(3)
+
+        with mock.patch.object(daemon, "_stream", autospec=True,
+                               side_effect=slow_stream):
+            start = time.monotonic()
+            daemon.SendMessage("hello", "tok-rl", "{}")
+        assert entered.wait(0.5) is True, "stream must start"
+        assert release.wait(0.5) is False, "stream must still be running"
+        assert time.monotonic() - start < 1.0, "SendMessage must return immediately"
+        release.set()

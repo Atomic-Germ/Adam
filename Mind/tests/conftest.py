@@ -30,5 +30,5 @@ def daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(bd.GLib, "idle_add", lambda *a, **k: None)
 
     d = bd.BubbleDaemon()
-    d._lock = threading.Lock()
+    d._lock = threading.RLock()
     yield d

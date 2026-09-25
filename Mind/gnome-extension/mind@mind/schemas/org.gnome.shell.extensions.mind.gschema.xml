@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
-  <schema id="org.gnome.shell.extensions.bubble"
-          path="/org/gnome/shell/extensions/bubble/">
+  <schema id="org.gnome.shell.extensions.mind"
+          path="/org/gnome/shell/extensions/mind/">
 
-    <key name="bubble-toggle" type="as">
+    <key name="mind-toggle" type="as">
       <default><![CDATA[['<Super>b']]]></default>
-      <summary>Toggle Bubble</summary>
+      <summary>Toggle Mind</summary>
       <description>
-        Keyboard shortcut to show or hide the Bubble chat panel.
-        Change with: gsettings set org.gnome.shell.extensions.bubble bubble-toggle "['&lt;Super&gt;b']"
+        Keyboard shortcut to show or hide the Mind chat panel.
+        Change with: gsettings set org.gnome.shell.extensions.mind mind-toggle "['&lt;Super&gt;b']"
       </description>
     </key>
 

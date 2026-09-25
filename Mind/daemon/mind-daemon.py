@@ -190,7 +190,7 @@ class BubbleDaemon:
     StatusChanged = signal()
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # Config (override via env for testing / CI).
         self._ctx_size = int(os.environ.get("MIND_CTX_SIZE", DEFAULT_CTX_SIZE))
@@ -270,7 +270,10 @@ class BubbleDaemon:
             self._history.append({"role": "user", "content": message})
             self._last_user_time = time.monotonic()
             self._trim_history()
-        GLib.idle_add(lambda: self._stream(token, message))
+        threading.Thread(
+            target=self._stream, args=(token, message), daemon=True,
+            name="mind-stream",
+        ).start()
 
     def SetSystemPrompt(self, prompt: str) -> None:
         with self._lock:
@@ -519,16 +522,49 @@ class BubbleDaemon:
                 replay = self._render_history()
         snapshot = [{"role": "user", "content": self._dream_prompt(reason, replay)}]
         model = self._auto_model()
-        payload = {"model": model, "messages": snapshot,
-                   "stream": False, "max_tokens": 600}
-        resp = requests.post(
-            f"{LLM_BASE}/v1/chat/completions", json=payload, timeout=(30, 300),
-        )
-        resp.raise_for_status()
-        return (
-            resp.json().get("choices", [{}])[0]
-                 .get("message", {}).get("content", "").strip()
-        )
+        log.info("Dreaming  reason=%s  model=%s", reason, model)
+        url = f"{LLM_BASE}/v1/chat/completions"
+        # Qwen3-style models spend tokens on reasoning_content before content;
+        # give the dream enough room so content is actually emitted.
+        with requests.post(
+            url,
+            json={"model": model, "messages": snapshot,
+                  "stream": True, "max_tokens": 4096},
+            timeout=(30, 300),
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            return self._consume_sse_text(resp)
+
+    def _consume_sse_text(self, resp) -> str:
+        """Read SSE deltas (content only) from a streaming reply."""
+        summary = ""
+        reasoning = ""
+        try:
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace")
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content")
+                if content:
+                    summary += content
+                elif delta.get("reasoning_content"):
+                    reasoning += delta["reasoning_content"]
+        except ChunkedEncodingError:
+            pass
+        if not summary.strip() and reasoning.strip():
+            return reasoning.strip()
+        return summary.strip()
 
     def _render_history(self) -> str:
         with self._lock:
@@ -588,7 +624,10 @@ class BubbleDaemon:
                 self._nudge_count += 1
             token = str(now)
             GLib.idle_add(self.NudgeStart, token, "idle", int(idle_min))
-            GLib.idle_add(lambda: self._clock_tick(token, int(idle_min)))
+            threading.Thread(
+                target=self._clock_tick, args=(token, int(idle_min)), daemon=True,
+                name="mind-clock-tick",
+            ).start()
             log.info("Clock tick fired  idle=%.1fm  token=%s", idle_min, token[:8])
 
     def _clock_tick(self, token: str, idle_minutes: int) -> None:

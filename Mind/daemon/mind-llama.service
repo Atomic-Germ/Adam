@@ -1,0 +1,13 @@
+[Unit]
+Description=Mind Llama — LLM service for the Mind body
+Before=mind.service
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=llama-server --load-mode streaming --gpu-pill --no-mmproj --spec-type none -c 48000 -gm 1 -gi -gpm 0.01 -gx --port 9999
+Restart=on-failure
+StandardError=journal
+
+[Install]
+WantedBy=default.target

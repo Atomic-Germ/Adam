@@ -373,7 +373,7 @@ export default class MindExtension extends Extension {
         // ── Root container ────────────────────────────────────────────────
         this._window = new St.BoxLayout({
             style_class: 'mind-window',
-            vertical:    true,
+            orientation: Clutter.Orientation.VERTICAL,
             width:       480,
             height:      580,
             visible:     false,
@@ -385,7 +385,7 @@ export default class MindExtension extends Extension {
         // ── Header ────────────────────────────────────────────────────────
         const header = new St.BoxLayout({
             style_class: 'mind-header',
-            vertical:    false,
+            orientation: Clutter.Orientation.HORIZONTAL,
         });
 
         const title = new St.Label({
@@ -397,7 +397,7 @@ export default class MindExtension extends Extension {
 
         const statusPill = new St.BoxLayout({
             style_class: 'mind-status',
-            vertical:    false,
+            orientation: Clutter.Orientation.HORIZONTAL,
             x_align:     Clutter.ActorAlign.END,
             y_align:     Clutter.ActorAlign.CENTER,
         });
@@ -446,7 +446,7 @@ export default class MindExtension extends Extension {
 
         this._msgBox = new St.BoxLayout({
             style_class: 'mind-msgs',
-            vertical:    true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand:    true,
         });
         this._scrollView.set_child(this._msgBox);
@@ -454,7 +454,7 @@ export default class MindExtension extends Extension {
         // ── Input bar ─────────────────────────────────────────────────────
         const inputRow = new St.BoxLayout({
             style_class: 'mind-input-row',
-            vertical:    false,
+            orientation: Clutter.Orientation.HORIZONTAL,
         });
 
         this._entry = new St.Entry({
@@ -721,7 +721,7 @@ export default class MindExtension extends Extension {
         const isUser = role === 'user';
 
         const row = new St.BoxLayout({
-            vertical: false,
+            orientation: Clutter.Orientation.HORIZONTAL,
             x_expand: true,
             x_align:  isUser
                 ? Clutter.ActorAlign.END
@@ -731,7 +731,7 @@ export default class MindExtension extends Extension {
         if (isUser) {
             const bubble = new St.BoxLayout({
                 style_class: 'mind-msg mind-msg-user',
-                vertical:    true,
+                orientation: Clutter.Orientation.VERTICAL,
             });
             const label = new St.Label({
                 text,
@@ -750,7 +750,7 @@ export default class MindExtension extends Extension {
         // ── Assistant bubble: vertical column with optional think section ──
         const col = new St.BoxLayout({
             style_class: 'mind-msg mind-msg-assistant',
-            vertical:    true,
+            orientation: Clutter.Orientation.VERTICAL,
         });
 
         // Toggle button — hidden until the first reasoning token arrives.

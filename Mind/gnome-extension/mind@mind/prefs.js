@@ -94,7 +94,7 @@ export default class MindPreferences extends ExtensionPreferences {
 
         const portRow = new Adw.ActionRow({
             title:    _('llama.cpp port'),
-            subtitle: _('Default 52625 — override with $FLM_SERVE_PORT in the service environment.'),
+            subtitle: _('Default 9999 — override with $MIND_LLM_URL in the service environment.'),
         });
         daemonGroup.add(portRow);
 

@@ -122,7 +122,9 @@ class _SentenceTransformerEmbedder:
         from sentence_transformers import SentenceTransformer
 
         self._model = SentenceTransformer(model_name)
-        self.dim = self._model.get_sentence_embedding_dimension()
+        getter = getattr(self._model, "get_embedding_dimension",
+                         self._model.get_sentence_embedding_dimension)
+        self.dim = getter()
 
     def encode(self, texts, show_progress_bar=False, convert_to_numpy=True):
         if isinstance(texts, str):
@@ -480,7 +482,9 @@ class MindMemory:
         """Store a previous dream in the same mental space as everything else."""
         if not (summary or "").strip():
             return 0
-        return self.add_chunked(summary, source="mind", kind="dream")
+        n = self.add_chunked(summary, source="mind", kind="dream")
+        self.save()
+        return n
 
     def has_dream(self) -> bool:
         return any(r.get("kind") == "dream" for r in self._records)
