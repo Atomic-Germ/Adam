@@ -631,7 +631,7 @@ class BubbleDaemon:
             log.info("Clock tick fired  idle=%.1fm  token=%s", idle_min, token[:8])
 
     def _clock_tick(self, token: str, idle_minutes: int) -> None:
-        """Non-streaming tick: the mind orients itself, speaks if it chooses."""
+        """Streaming tick: the mind orients itself, speaks if it chooses."""
         with self._lock:
             snapshot = [{"role": "system", "content": self._build_system_content()}]
             snapshot.extend(self._history)
@@ -650,14 +650,11 @@ class BubbleDaemon:
             f"required to speak.]"
         )
         snapshot.append({"role": "user", "content": clock_tick_msg})
-        payload = {"model": model, "messages": snapshot, "stream": False, "max_tokens": 300}
+        payload = {"model": model, "messages": snapshot, "stream": True, "max_tokens": 300}
         try:
-            resp = requests.post(url, json=payload, timeout=(10, 90))
-            resp.raise_for_status()
-            clean_text = (
-                resp.json().get("choices", [{}])[0]
-                     .get("message", {}).get("content", "").strip()
-            )
+            with requests.post(url, json=payload, timeout=(30, 300), stream=True) as resp:
+                resp.raise_for_status()
+                clean_text = self._consume_sse_text(resp)
         except RequestException as exc:
             log.error("Clock tick error  token=%s  %s", token[:8], exc)
             return
