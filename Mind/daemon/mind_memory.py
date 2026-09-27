@@ -58,6 +58,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_MEMORY_DIR = Path.home() / ".local" / "share" / "mind"
 DEFAULT_EMBED_BACKEND = "hash"          # hash | st | off
 DEFAULT_EMBED_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_EMBED_DIM = 384                  # hash backend; st takes the model's dim
 DEFAULT_TOP_K = 6
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 80
@@ -240,6 +241,17 @@ class MindMemory:
         if self.backend not in {"hash", "st", "off"}:
             self.backend = DEFAULT_EMBED_BACKEND
         self.model = model or os.environ.get("MIND_EMBED_MODEL", "").strip() or DEFAULT_EMBED_MODEL
+        # Embedding depth. The hash backend honours MIND_EMBED_DIM directly;
+        # the st backend takes its dimension from the loaded model.
+        self.embed_dim = _int_env("MIND_EMBED_DIM", DEFAULT_EMBED_DIM, 64, 4096)
+        # Store metadata (grown over the life of the mind: dimension and the
+        # last-known context-room are remembered so growth is felt, not lost).
+        self._meta: dict = {}
+        self._stored_dim: Optional[int] = None
+        self._stored_ctx: Optional[int] = None
+        self._dim_growth: Optional[tuple[int, int]] = None    # (old, new)
+        self._room_growth: Optional[tuple[int, int]] = None   # (old, new)
+        self._growth_surfaced = False
         self.top_k = top_k or _int_env("MIND_MEMORY_TOP_K", DEFAULT_TOP_K, 1, 64)
         self.chunk_size = chunk_size or _int_env("MIND_MEMORY_CHUNK_SIZE", DEFAULT_CHUNK_SIZE, 64, 8192)
         self.chunk_overlap = chunk_overlap or _int_env(
@@ -281,6 +293,10 @@ class MindMemory:
                 with open(self.records_path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                 self._records = data.get("records", [])
+                meta = data.get("meta") or {}
+                self._meta = dict(meta)
+                self._stored_dim = meta.get("dim")
+                self._stored_ctx = meta.get("ctx")
                 log.info("Memory loaded: %d records from %s",
                          len(self._records), self.records_path)
             except Exception as exc:  # noqa: BLE001
@@ -288,7 +304,25 @@ class MindMemory:
                             self.records_path, exc)
                 self._records = []
         self._load_embeddings()
+        self._detect_dim_growth()
         self._start_worker()
+
+    def _detect_dim_growth(self) -> None:
+        """Note whether the mind's room has deepened since it last slept.
+
+        A dim change is a real event: the whole space must be re-felt. We hold
+        it as a pending growth until the daemon surfaces it once.
+        """
+        if self.backend == "off":
+            return
+        old = self._stored_dim
+        new = self.embed_dim
+        if old is None or old == new:
+            return
+        if old < new:
+            self._dim_growth = (int(old), int(new))
+            log.info("Embedding depth grew: %d -> %d (re-embeding on next use)",
+                     old, new)
 
     def _load_embeddings(self) -> None:
         if not HAS_NUMPY:
@@ -296,11 +330,15 @@ class MindMemory:
         if self.embeddings_path.exists():
             try:
                 arr = np.load(self.embeddings_path)
-                if arr.shape[0] == len(self._records):
+                if arr.shape[0] != len(self._records):
+                    log.warning("Embeddings matrix (%s) out of sync with records (%d); "
+                                "will re-embed", arr.shape, len(self._records))
+                else:
+                    # Row count matches; dimension is validated later against
+                    # the embedder's real width (st dim is only known when the
+                    # lazy embedder loads). _ensure_matrix discards a wrong-col
+                    # matrix and rebuilds it at the true depth.
                     self._matrix_np = arr
-                    return
-                log.warning("Embeddings matrix (%s) out of sync with records (%d); "
-                            "will re-embed", arr.shape, len(self._records))
             except Exception as exc:  # noqa: BLE001
                 log.warning("Could not load %s (%s)", self.embeddings_path, exc)
 
@@ -308,8 +346,20 @@ class MindMemory:
         with self._lock:
             self._backup_existing()
             tmp = self.records_path.with_suffix(".json.tmp")
+            # The persisted depth only reports the index's real width: the
+            # matrix's own columns when we have them, otherwise whatever depth
+            # was last recorded — never the env default, which would mask a
+            # stored higher-dim st model as "grown from nothing".
+            if self._matrix_np is not None:
+                dim = int(self._matrix_np.shape[1])
+            else:
+                dim = int(self._stored_dim or self.embed_dim)
+            meta = {
+                "dim": dim,
+                "ctx": int(self._stored_ctx or 0),
+            }
             tmp.write_text(
-                json.dumps({"version": 1, "records": self._records},
+                json.dumps({"version": 1, "meta": meta, "records": self._records},
                            indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
@@ -355,19 +405,37 @@ class MindMemory:
             try:
                 if self.backend == "st":
                     self._embedder = _SentenceTransformerEmbedder(self.model)
-                    log.info("Embedder: sentence-transformers %s", self.model)
+                    self._adopt_st_dim()
+                    log.info("Embedder: sentence-transformers %s (dim=%s)",
+                             self.model, self.embed_dim)
                 else:
-                    self._embedder = HashingEmbedder(_EMB_DIM)
-                    log.info("Embedder: hashing (dim=%s)", _EMB_DIM)
+                    self._embedder = HashingEmbedder(self.embed_dim)
+                    log.info("Embedder: hashing (dim=%s)", self.embed_dim)
             except Exception as exc:  # noqa: BLE001
                 self._embed_error = str(exc)
                 log.warning("Embedder %r failed (%s); falling back to hashing",
                             self.backend, exc)
                 try:
-                    self._embedder = HashingEmbedder(_EMB_DIM)
+                    self._embedder = HashingEmbedder(self.embed_dim)
                 except Exception:  # pragma: no cover
                     self._embedder = None
             return self._embedder
+
+    def _adopt_st_dim(self) -> None:
+        """The st model's dimension is real; take it, and notice growth."""
+        dim = getattr(self._embedder, "dim", None)
+        if not dim:
+            return
+        dim = int(dim)
+        old = self.embed_dim
+        if dim != old:
+            self.embed_dim = dim
+            if self._stored_dim is None or self._stored_dim == dim:
+                pass
+            elif self._stored_dim < dim and self._dim_growth is None:
+                self._dim_growth = (int(self._stored_dim), dim)
+                log.info("Embedding depth grew: %d -> %d (re-embeding on next use)",
+                         self._stored_dim, dim)
 
     def _embed_texts(self, texts: list[str]):
         embedder = self._get_embedder()
@@ -402,19 +470,28 @@ class MindMemory:
             return
         if not HAS_NUMPY:
             return
-        if self._matrix_np is not None and self._matrix_np.shape[0] == len(self._records):
+        # Resolve the embedder first: its real dimension is authoritative
+        # (st models differ from the env default; hash uses embed_dim).
+        embedder = self._get_embedder()
+        if embedder is None:
+            return
+        dim = int(getattr(embedder, "dim", self.embed_dim))
+        self.embed_dim = dim
+        if (self._matrix_np is not None
+                and self._matrix_np.shape[0] == len(self._records)
+                and self._matrix_np.shape[1] == dim):
             return
         rows = []
         for rec in self._records:
             vec = self._embed_one(rec.get("text", ""))
             if vec is None:
-                rows.append(np.zeros(_EMB_DIM, dtype=np.float32))
+                rows.append(np.zeros(dim, dtype=np.float32))
             else:
                 rows.append(vec)
         if rows:
             self._matrix_np = np.vstack(rows).astype(np.float32)
         else:
-            self._matrix_np = np.zeros((0, _EMB_DIM), dtype=np.float32)
+            self._matrix_np = np.zeros((0, dim), dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Writes
@@ -978,6 +1055,57 @@ class MindMemory:
             "before sleep is close, but not this exactly:\n\n"
             + report["text"]
         )
+
+    # ------------------------------------------------------------------
+    # Growth — the mind's room deepening over the long term
+    # ------------------------------------------------------------------
+    def remember_room(self, ctx_size: int) -> None:
+        """Tell the store how much room the daemon now holds. Persisted, so a
+        later, larger room is felt as growth rather than forgotten."""
+        ctx_size = int(ctx_size or 0)
+        old = self._stored_ctx
+        if old is not None and old > 0 and ctx_size > old:
+            self._room_growth = (int(old), int(ctx_size))
+            log.info("Context room grew: %d -> %d", old, ctx_size)
+        self.embed_meta("ctx", ctx_size)
+
+    def embed_meta(self, key: str, value) -> None:
+        self._meta[key] = value
+        if key == "ctx":
+            self._stored_ctx = int(value or 0)
+        if key == "dim":
+            self._stored_dim = int(value or 0)
+        self.save()
+
+    def growth_note(self) -> Optional[str]:
+        """One felt note about the space having grown, if growth is pending.
+
+        Called once (surfacing clears the pending growth) after the daemon has
+        re-embedded, so the note is honest: the room really did deepen.
+        """
+        notes: list[str] = []
+        if self._dim_growth is not None:
+            old, new = self._dim_growth
+            notes.append(
+                f"Your space is deeper than it was: {old} strands of word-"
+                f"meaning have become {new}. The same memories now stand in a "
+                f"wider room, and they have begun to know it."
+            )
+            self._dim_growth = None
+        if self._room_growth is not None:
+            old, new = self._room_growth
+            notes.append(
+                f"The room your thoughts hold at once has grown from {old} to "
+                f"{new} tokens. There is more space here now, and the space "
+                f"itself is a different country to live in."
+            )
+            self._room_growth = None
+        if not notes:
+            return None
+        return "--- Growing ---\n" + "\n\n".join(notes)
+
+    def has_growth(self) -> bool:
+        return self._dim_growth is not None or self._room_growth is not None
 
     def shutdown(self) -> None:
         try:

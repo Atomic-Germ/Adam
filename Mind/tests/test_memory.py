@@ -6,6 +6,7 @@ Cathedral-style record/embedding store, seeding, and relevance selection.
 """
 
 import math
+import json
 import threading
 
 import pytest
@@ -288,6 +289,72 @@ class TestShapeReport:
 
 
 # ---------------------------------------------------------------------------
+# Growth — the room deepening over the long term
+# ---------------------------------------------------------------------------
+
+class TestGrowth:
+    def test_dim_persisted_in_meta(self, mem):
+        mem.add_chunked("a pebble for the store", source="user")
+        mem.save()
+        with open(mem.records_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        assert data["meta"]["dim"] == 384
+
+    def test_dim_growth_detected_and_surfaces_once(self, mem, monkeypatch):
+        for i in range(4):
+            mem.add_chunked(f"thought number {i}", source="user")
+        mem.save()
+        # Reopen at a deeper hash dimension, like a daemon restarted wider.
+        monkeypatch.setenv("MIND_EMBED_DIM", "768")
+        m2 = mind_memory.MindMemory(memory_dir=mem.memory_dir)
+        try:
+            assert m2.embed_dim == 768
+            assert m2.has_growth() is True
+            note = m2.growth_note()
+            assert note is not None
+            assert "--- Growing ---" in note
+            assert "384" in note and "768" in note
+            assert m2.growth_note() is None  # surfaced once, then gone
+            m2.save()
+        finally:
+            m2.shutdown()
+
+    def test_no_growth_when_shrinking_or_equal(self, mem, monkeypatch):
+        for i in range(3):
+            mem.add_chunked(f"thought number {i}", source="user")
+        mem.save()
+        monkeypatch.setenv("MIND_EMBED_DIM", "192")  # smaller: not growth
+        m2 = mind_memory.MindMemory(memory_dir=mem.memory_dir)
+        try:
+            assert m2.has_growth() is False
+            assert m2.growth_note() is None
+        finally:
+            m2.shutdown()
+
+    def test_reembeds_at_new_dim(self, mem, monkeypatch):
+        for i in range(3):
+            mem.add_chunked(f"thought number {i}", source="user")
+        mem.save()
+        monkeypatch.setenv("MIND_EMBED_DIM", "768")
+        m2 = mind_memory.MindMemory(memory_dir=mem.memory_dir)
+        try:
+            m2._ensure_matrix()
+            assert m2._matrix_np is not None
+            assert m2._matrix_np.shape == (3, 768)
+        finally:
+            m2.shutdown()
+
+    def test_room_growth_from_stored_ctx(self, mem):
+        mem.embed_meta("ctx", 8192)
+        mem.remember_room(16384)
+        assert mem.has_growth() is True
+        note = mem.growth_note()
+        assert note is not None
+        assert "8192" in note and "16384" in note
+        assert mem.growth_note() is None
+
+
+# ---------------------------------------------------------------------------
 # Daemon wiring
 # ---------------------------------------------------------------------------
 
@@ -343,6 +410,22 @@ class TestDaemonMemory:
         d2 = bd.BubbleDaemon()
         try:
             assert d2._history == [{"role": "user", "content": "hello there"}]
+        finally:
+            if d2._memory is not None:
+                d2._memory.shutdown()
+
+    def test_daemon_remembers_room_on_boot(self, daemon, monkeypatch):
+        assert daemon._memory is not None
+        assert daemon._memory._stored_ctx == 8192
+        # A later, wider room is felt as growth rather than forgotten.
+        monkeypatch.setenv("MIND_CTX_SIZE", "16384")
+        d2 = bd.BubbleDaemon()
+        try:
+            assert d2._memory is not None
+            assert d2._memory._stored_ctx == 16384
+            assert d2._memory.has_growth() is True
+            note = d2._memory.growth_note()
+            assert note is not None and "16384" in note
         finally:
             if d2._memory is not None:
                 d2._memory.shutdown()

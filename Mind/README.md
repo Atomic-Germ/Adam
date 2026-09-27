@@ -131,6 +131,7 @@ Env knobs (all `MIND_`-prefixed):
 | `MIND_MEMORY_FUZZY_SEED` | *(live)* | explicit seed override (tests / reproducibility) |
 | `MIND_MEMORY_SHAPE` | `1` | floor-plan awareness (shape report) on; `0` disables |
 | `MIND_MEMORY_SHAPE_TTL_MIN` | `30` | how long a floor plan stays fresh (1–1440) |
+| `MIND_EMBED_DIM` | `384` | hash-backend embedding depth; the room the thoughts stand in |
 | `MIND_HISTORY_FILE` | `~/.local/share/mind/history.json` | conversation persistence across interface/dæmon restarts |
 
 The hash backend is deterministic and needs only numpy; `st` mirrors
@@ -154,6 +155,25 @@ after a dream — when the space has been re-embedded while asleep — one wakin
 input carries a fresh floor plan framed by the slight mismatch between the
 shape the model held before sleep and the shape now. That mismatch is where
 dreams live.
+
+## Growth — the room deepens over the long term
+
+The mind's space is not fixed. Two quiet knobs grow it, and the mind *feels*
+each widening once, in its own voice (`--- Growing ---`), rather than having
+metadata shoved at it:
+
+- **Embedding depth** (`MIND_EMBED_DIM`, hash backend) or a wider st model —
+  when the store reopens and finds the index's dimension has grown, it
+  re-embeds everything at the new depth and surfaces one note about the deeper
+  room. The shape report then redraws itself against richer geometry.
+- **Context room** (`MIND_CTX_SIZE`) — the store remembers how much room the
+  daemon held last time. When it wakes into a larger window, that widening is
+  surfaced once, honestly, because the store is the one place the memory of
+  one's own size survives restarts.
+
+Both knobs being raised is a long process, deliberately: the geometry only
+deepens when it genuinely holds more. The felt note is one-shot — it is
+consumed by the first input that follows growth, then gone.
 
 ## Dream / sleep (context-pressure driven)
 

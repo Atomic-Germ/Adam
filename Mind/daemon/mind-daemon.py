@@ -259,6 +259,14 @@ class BubbleDaemon:
                 log.warning("Memory seeding skipped: %s", exc)
         self._maybe_first_dream()
 
+        # The store remembers how much room the mind holds; a later, larger
+        # room is felt as growth rather than forgotten across restarts.
+        if self._memory is not None:
+            try:
+                self._memory.remember_room(self._ctx_size)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Room-remember failed: %s", exc)
+
         # System prompt / identity framing (settable at runtime).
         self._system_prompt = ""
         env_prompt = os.environ.get("MIND_SYSTEM_PROMPT", "").strip()
@@ -399,6 +407,16 @@ class BubbleDaemon:
         with self._lock:
             snapshot = [{"role": "system", "content": self._build_system_content(message, wake_note)}]
             snapshot.extend(self._history)
+        # Growth is surfaced once, on the first input after the room deepened
+        # (the memory-block build above already forced any re-embedding, so
+        # the note is honest: the space truly did widen).
+        if self._memory is not None:
+            try:
+                growth_note = self._memory.growth_note()
+                if growth_note and snapshot:
+                    snapshot[0]["content"] += "\n\n" + growth_note
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Growth note failed: %s", exc)
         model = self._auto_model()
         url = f"{LLM_BASE}/v1/chat/completions"
         log.info("Streaming  token=%s  model=%s  msgs=%d",

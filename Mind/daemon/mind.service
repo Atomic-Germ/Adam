@@ -16,7 +16,7 @@ StandardError=journal
 # Default: http://127.0.0.1:9999. Override with MIND_LLM_URL below.
 Environment=MIND_LLM_URL=http://127.0.0.1:9999
 Environment=MIND_EMBED_BACKEND=st
-Environment=MIND_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+Environment=MIND_EMBED_MODEL=sentence-transformers/all-MiniLM-L12-v2
 Environment=MIND_MEMORY_TOP_K=4
 Environment=MIND_MEMORY_CHUNK_SIZE=512
 Environment=MIND_MEMORY_CHUNK_OVERLAP=80
@@ -33,6 +33,11 @@ Environment=MIND_MEMORY_SHAPE=1
 # Sleep is the only event that clears the conversation — and even then a few
 # closing turns stay at the foot of the fresh window.
 Environment=MIND_SLEEP_KEEP_TURNS=4
+# Growth: the store remembers this context room across restarts and surfaces
+# one felt note (--- Growing ---) if the mind wakes into a larger window or a
+# deeper embedding dimension. The st backend takes its depth from the model;
+# the hash backend honours MIND_EMBED_DIM. Raise these slowly — the geometry
+# only deepens when it genuinely holds more.
 
 PassEnvironment=MIND_MODEL 
 # Identity/values framing sent as the system role (takes effect immediately).
