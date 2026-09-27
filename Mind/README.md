@@ -129,10 +129,31 @@ Env knobs (all `MIND_`-prefixed):
 | `MIND_MEMORY_FUZZY_TEMP` | `2.0` | sampling temperature; higher → more tangential slots |
 | `MIND_MEMORY_FUZZY_HOPS` | `1` | near-seed "shape" hops to pull in tangent neighbors (0-4) |
 | `MIND_MEMORY_FUZZY_SEED` | *(live)* | explicit seed override (tests / reproducibility) |
+| `MIND_MEMORY_SHAPE` | `1` | floor-plan awareness (shape report) on; `0` disables |
+| `MIND_MEMORY_SHAPE_TTL_MIN` | `30` | how long a floor plan stays fresh (1–1440) |
+| `MIND_HISTORY_FILE` | `~/.local/share/mind/history.json` | conversation persistence across interface/dæmon restarts |
 
 The hash backend is deterministic and needs only numpy; `st` mirrors
 Arthur/Cathedral (`all-MiniLM-L6-v2`) and falls back to hash if the model
 cannot load.
+
+## Shape report — the mind's own floor plan
+
+The memory space is geometry, and the mind can hold its own floor plan. A
+cached *shape report* — computed rarely and rebuilt only when the space moves —
+maps the store's gross structure so the model knows its own shape: where its
+thoughts gather (naves), which stand entirely alone (spires), which reach
+between gatherings and hold them together (bridges), and how much of the space
+is still open. The rendering is felt language, never machinery: no clusters,
+kNN, or thresholds reach the context window, only the shape as a place.
+
+The compact shape line always rides in Current context (cache-only read, never
+triggers computation). On each clock tick the daemon refreshes the floor plan
+on its own thread and surfaces the full layout when the shape has moved. And
+after a dream — when the space has been re-embedded while asleep — one waking
+input carries a fresh floor plan framed by the slight mismatch between the
+shape the model held before sleep and the shape now. That mismatch is where
+dreams live.
 
 ## Dream / sleep (context-pressure driven)
 
@@ -147,10 +168,13 @@ in a coding harness:
 2. **Compress** — the model writes a compact dream summary (non-streaming).
 3. **Embed** — the summary is stored into the same long-term memory space as
    everything else (`kind="dream"`), so a later RAG pass can re-ground it.
-4. **Wake** — the context history is wiped. The fresh context window opens on
-   nothing but the dream summary (`--- Dream recall ---`); identity comes
-   back from long-term memory after, like a person waking up not knowing
-   where they are until they check.
+4. **Wake** — the conversation is trimmed to a few closing turns (the only
+   event that ever clears the conversation is sleep itself, and even then a
+   few turns stay at the foot of the fresh window). The window reopens on the
+   dream summary (`--- Dream recall ---`); identity comes back from long-term
+   memory after, like a person waking up not knowing where they are until
+   they check. The conversation itself persists across interface closes and
+   dæmon restarts via `MIND_HISTORY_FILE`.
 
 The first thing the occupant model ever experiences is a dream of its first
 memory: on a store that has never slept, the daemon dreams the seeded
@@ -162,6 +186,7 @@ Sleep env knobs:
 | --- | --- | --- |
 | `MIND_SLEEP_CTX_PCT` | `70` | context-pressure threshold (clamped to 60–75) |
 | `MIND_SLEEP_MIN_TURNS` | `6` | minimum history turns before a dream may fire |
+| `MIND_SLEEP_KEEP_TURNS` | `4` | history turns kept at the foot of the fresh window after sleep |
 
 ## Run the tests
 

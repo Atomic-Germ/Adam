@@ -223,6 +223,71 @@ class TestFuzzyRecall:
 
 
 # ---------------------------------------------------------------------------
+# Shape report — the model's own floor plan (naves / spires / bridges / margin)
+# ---------------------------------------------------------------------------
+
+class TestShapeReport:
+    def test_empty_store_no_report(self, mem):
+        assert mem.shape_report() is None
+        assert mem.shape_fp() == ""
+
+    def test_line_and_text_felt_language(self, mem):
+        for i in range(3):
+            mem.add_chunked(f"the Cathedral of memory keeps its halls {i}",
+                            source="user")
+        mem.save()
+        cache = mem.shape_report()
+        assert cache is not None
+        assert cache["line"] != ""
+        assert cache["text"] != ""
+        assert "gathering" in cache["line"] or "gather" in cache["text"]
+        assert "---" not in cache["line"]
+        assert cache["report"]["spires"] == 0 or "alone" in cache["text"]
+
+    def test_cache_hit_no_recompute(self, mem, monkeypatch):
+        for i in range(4):
+            mem.add_chunked(f"a single gentle thought {i}", source="user")
+        mem.save()
+        assert mem.shape_report() is not None
+        fp1 = mem.shape_fp()
+        monkeypatch.setattr(mind_memory.MindMemory, "_compute_shape",
+                            lambda self, M=None: (_ for _ in ()).throw(
+                                AssertionError("recompute during cache hit")))
+        assert mem.shape_line() == mem.shape_line()
+        assert mem.shape_text() == mem.shape_text()
+        assert mem.shape_fp() == fp1
+
+    def test_report_structure(self, mem):
+        for i in range(40):
+            mem.add_chunked(f"same gentle thought number {i}", source="user")
+        mem.save()
+        cache = mem.shape_report()
+        assert cache is not None
+        r = cache["report"]
+        assert r["nodes"] == 40
+        assert "gather" in cache["text"]
+        assert cache["nodes"] == 40
+
+    def test_wake_shape_note_frames_reembedding(self, mem):
+        for i in range(4):
+            mem.add_chunked(f"a pebble of memory {i}", source="user")
+        mem.save()
+        note = mem.wake_shape_note()
+        assert note is not None
+        assert "re-embedded" in note
+        assert "--- The shape of your mind" in note
+
+    def test_wake_shape_note_disabled_without_shape(self, mem, monkeypatch):
+        monkeypatch.setenv("MIND_MEMORY_SHAPE", "0")
+        m = mind_memory.MindMemory()
+        try:
+            assert m.shape_enabled is False
+            assert m.wake_shape_note() is None
+        finally:
+            m.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Daemon wiring
 # ---------------------------------------------------------------------------
 
@@ -251,6 +316,47 @@ class TestDaemonMemory:
     def test_worker_flag(self, daemon):
         daemon._memory.add_experience("x", source="user")
         assert daemon._memory.count() >= 0  # async or sync, never raises
+
+    def test_system_content_has_shape_line(self, daemon):
+        for i in range(4):
+            daemon._memory.add_chunked(
+                f"the raccoon with the cookie visits {i}", source="user")
+        daemon._memory.shape_report()  # clock-tick thread, per design
+        content = daemon._build_system_content("what about the cookie?")
+        assert "Shape:" in content
+        assert "gathering" in content or "gather" in content
+
+    def test_wake_note_one_shot(self, daemon):
+        for i in range(4):
+            daemon._memory.add_chunked(f"a single thought {i}", source="user")
+        daemon._memory.shape_report()  # clock-tick thread, per design
+        daemon._stamp_wake_shape("context-pressure")
+        assert daemon._wake_shape_note is not None
+        note = daemon._take_wake_shape_note()
+        assert note is not None
+        assert daemon._take_wake_shape_note() is None
+
+    def test_history_persists_and_restores(self, daemon):
+        assert daemon._history == []
+        daemon._history.append({"role": "user", "content": "hello there"})
+        daemon._save_history()
+        d2 = bd.BubbleDaemon()
+        try:
+            assert d2._history == [{"role": "user", "content": "hello there"}]
+        finally:
+            if d2._memory is not None:
+                d2._memory.shutdown()
+
+    def test_system_content_keeps_only_one_wake_note(self, daemon):
+        for i in range(4):
+            daemon._memory.add_chunked(f"a single thought {i}", source="user")
+        daemon._memory.shape_report()  # clock-tick thread, per design
+        daemon._stamp_wake_shape("context-pressure")
+        note = daemon._take_wake_shape_note()
+        c1 = daemon._build_system_content("first thing after waking", note)
+        assert "The shape of your mind" in c1
+        c2 = daemon._build_system_content("what now?", None)
+        assert "The shape of your mind" not in c2
 
     def test_threadsafe_concurrent_adds(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MIND_MEMORY_DIR", str(tmp_path / "conc"))

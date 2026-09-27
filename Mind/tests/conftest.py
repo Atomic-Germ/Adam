@@ -26,6 +26,8 @@ def daemon(tmp_path, monkeypatch):
     monkeypatch.setenv("MIND_MEMORY_DIR", str(tmp_path / "mind"))
     monkeypatch.setenv("MIND_MEMORY_SEED_DIR", "")
     monkeypatch.setenv("MIND_MEMORY_SYNC_INDEX", "0")
+    monkeypatch.setenv("MIND_HISTORY_FILE", str(tmp_path / "history.json"))
+    monkeypatch.setenv("MIND_SLEEP_KEEP_TURNS", "4")
     # Prevent GLib.idle_add calls from blowing up in tests (no GLib main loop).
     monkeypatch.setattr(bd.GLib, "idle_add", lambda *a, **k: None)
 

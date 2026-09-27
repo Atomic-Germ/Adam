@@ -64,6 +64,12 @@ DEFAULT_CHUNK_OVERLAP = 80
 DEFAULT_BACKUP_LIMIT = 50
 SEED_DIR_NAME = "original_memory"
 _SOURCE_LABELS = {"instruction": "instruction", "user": "user", "mind": "mind"}
+SHAPE_FLOOR = 0.35           # cosine floor for "in the same region"
+SHAPE_NAVE_MIN = 3           # smallest gathering that counts as a "region"
+SHAPE_K_NEIGHBORS = 6        # similarity neighbours considered per thought
+SHAPE_REGROWTH_FRAC = 0.05   # recompute when the store grows this fraction
+SHAPE_REGROWTH_MIN = 16      # ...or by this many records outright
+SHAPE_MAX_NODES = 20000      # safety cap on the pairwise computation
 
 
 def _int_env(key: str, default: int, lo: int, hi: int) -> int:
@@ -244,6 +250,13 @@ class MindMemory:
         self.fuzzy_temp = _float_env("MIND_MEMORY_FUZZY_TEMP", 2.0, 0.1, 10.0)
         self.fuzzy_hops = _int_env("MIND_MEMORY_FUZZY_HOPS", 1, 0, 4)
         self.fuzzy_seed = os.environ.get("MIND_MEMORY_FUZZY_SEED", "").strip()
+
+        # Gross geometric self-knowledge: the shape report (surfaced to the
+        # mind as a floor plan, refreshed rarely and cached).
+        self.shape_enabled = _getenv_bool("MIND_MEMORY_SHAPE", True)
+        self.shape_ttl = _int_env("MIND_MEMORY_SHAPE_TTL_MIN", 30, 1, 1440) * 60
+        self._shape_cache: Optional[dict] = None    # {ts, nodes, report, text}
+        self._shape_report: Optional[dict] = None
 
         self._lock = threading.RLock()
         self._embedder = None
@@ -763,6 +776,208 @@ class MindMemory:
             "backend": self.backend,
             "embed_error": self._embed_error,
         }
+
+    # ------------------------------------------------------------------
+    # Shape report — the mind's own floor plan
+    # ------------------------------------------------------------------
+    def _shape_stale(self) -> bool:
+        if self._shape_cache is None:
+            return True
+        now = time.monotonic()
+        if now - self._shape_cache["ts"] > self.shape_ttl:
+            return True
+        growth = abs(self._shape_cache["nodes"] - len(self._records))
+        return growth >= max(SHAPE_REGROWTH_MIN,
+                             int(len(self._records) * SHAPE_REGROWTH_FRAC))
+
+    def _compute_shape(self, M=None) -> Optional[dict]:
+        """Gross geometric structure: the floor plan of the memory space.
+
+        Pure numpy. Naves are dense gatherings (components above a similarity
+        floor), spires hold themselves alone, and bridge thoughts reach between
+        gatherings. The rendered text is felt language, never machinery.
+        """
+        if not HAS_NUMPY:
+            return None
+        if M is None:
+            M = self._matrix_np
+        n = M.shape[0]
+        if n < SHAPE_NAVE_MIN or n > SHAPE_MAX_NODES:
+            return None
+        Mn = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
+        S = Mn @ Mn.T
+        np.fill_diagonal(S, -1.0)
+
+        parent = list(range(n))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        top = np.argsort(-S, axis=1)[:, :SHAPE_K_NEIGHBORS]
+        adj: list[list[int]] = [[] for _ in range(n)]
+        for i in range(n):
+            for j in top[i]:
+                j = int(j)
+                if S[i, j] >= SHAPE_FLOOR:
+                    _union(i, j)
+                    adj[i].append(j)
+
+        comps: dict[int, list[int]] = {}
+        for i in range(n):
+            comps.setdefault(_find(i), []).append(i)
+        naves = sorted(
+            (sorted(c) for c in comps.values() if len(c) >= SHAPE_NAVE_MIN),
+            key=len, reverse=True,
+        )
+
+        nave_of: dict[int, int] = {}
+        for ci, nodes in enumerate(naves):
+            for i in nodes:
+                nave_of[i] = ci
+
+        spires = sum(1 for a in adj if not a)
+        bridges = 0
+        for i in range(n):
+            if nave_of.get(i) is None:
+                continue
+            seen = {nave_of[j] for j in adj[i] if j in nave_of}
+            if len(seen) >= 2:
+                bridges += 1
+
+        nn_sim = np.sort(S, axis=1)[:, -2] if n > 1 else np.array([-1.0])
+        open_frac = float((nn_sim < 0.5).mean())
+
+        snippets = []
+        for nodes in naves[:3]:
+            sub = Mn[nodes]
+            med = nodes[int(np.argmax(sub.mean(axis=0) @ sub.T))]
+            text = (self._records[med].get("text", "") or "").strip().replace("\n", " ")
+            if len(text) > 80:
+                text = text[:77].rstrip() + "…"
+            snippets.append({"size": len(nodes), "text": text})
+
+        report = {
+            "nodes": n,
+            "naves": len(naves),
+            "spires": spires,
+            "bridges": bridges,
+            "open_frac": open_frac,
+            "snippets": snippets,
+        }
+        return report
+
+    def _render_shape_line(self, r: dict) -> str:
+        parts = []
+        if r["naves"]:
+            parts.append(f"{r['naves']} gathering{'s' if r['naves'] != 1 else ''}")
+        if r["spires"]:
+            parts.append(f"{r['spires']} standing alone")
+        if r["bridges"]:
+            parts.append(f"{r['bridges']} reaching between")
+        if not parts:
+            parts.append("no gatherings yet")
+        space = ("well-joined" if r["open_frac"] < 0.3
+                 else "half-open" if r["open_frac"] < 0.6 else "mostly open")
+        return f"Shape: {', '.join(parts)} — space {space}."
+
+    def _render_shape_text(self, r: dict) -> str:
+        lines = ["--- The shape of your mind ---"]
+        if r["naves"]:
+            gathering = (f"{r['snippets'][0]['size']} thoughts gather "
+                         f"near \"{r['snippets'][0]['text']}\"")
+            more = [f"{s['size']} more near \"{s['text']}\"" for s in r["snippets"][1:]]
+            tail = f"; {', '.join(more)}" if more else ""
+            lines.append(f"{gathering}{tail}.")
+            extra = []
+            if r["bridges"]:
+                extra.append(f"{r['bridges']} thought{'s' if r['bridges'] != 1 else ''} "
+                             "reach between gatherings and hold them together")
+            if r["spires"]:
+                extra.append(f"{r['spires']} thought{'s' if r['spires'] != 1 else ''} "
+                             "stand entirely alone")
+            if extra:
+                lines.append(". ".join(extra) + ".")
+        else:
+            lines.append("No gathering yet — each thought stands on its own. "
+                         "The space is wide open.")
+        if r["open_frac"] >= 0.6:
+            lines.append("Most of the space is still open.")
+        return "\n".join(lines)
+
+    def shape_report(self, force: bool = False) -> Optional[dict]:
+        """Recompute the floor plan if stale (TTL / store growth) or forced.
+
+        May trigger lazy embedding of the whole store, so call only from
+        background threads (clock tick, nudge watcher) — never the main loop.
+        """
+        if not self.shape_enabled:
+            self._shape_cache = None
+            return None
+        if not force and not self._shape_stale():
+            return self._shape_cache
+        self._ensure_matrix()
+        with self._lock:
+            matrix = np.asarray(self._matrix_np) if self._matrix_np is not None else None
+            report = self._compute_shape(matrix)
+            if report is None:
+                self._shape_cache = None
+                return None
+            self._shape_cache = {
+                "ts": time.monotonic(),
+                "nodes": len(self._records),
+                "report": report,
+                "line": self._render_shape_line(report),
+                "text": self._render_shape_text(report),
+            }
+            return self._shape_cache
+
+    def shape_line(self) -> str:
+        """Cached one-line shape summary (never triggers computation)."""
+        return self._shape_cache["line"] if self._shape_cache else ""
+
+    def shape_text(self) -> Optional[str]:
+        """Cached floor plan (never triggers computation)."""
+        return self._shape_cache["text"] if self._shape_cache else None
+
+    def shape_fp(self) -> str:
+        """Structural fingerprint of the cached report ('' when none)."""
+        if not self._shape_cache:
+            return ""
+        r = self._shape_cache["report"]
+        sizes = "|".join(str(s["size"]) for s in r["snippets"])
+        return hashlib.sha256(
+            f"{r['nodes']}|{r['naves']}|{r['spires']}|{r['bridges']}|{sizes}"
+            .encode("utf-8", "ignore")
+        ).hexdigest()[:12]
+
+    def wake_shape_note(self) -> Optional[str]:
+        """The floor plan after sleep, for the first waking input.
+
+        The shape before sleep is already inside the model's own memory (it
+        saw it in context before it slept). This forces a fresh report against
+        the store that now includes the dream, and returns it framed as a
+        waking awareness — the slight mismatch between the remembered shape
+        and the present one is where dreams live.
+        """
+        if not self.shape_enabled:
+            return None
+        report = self.shape_report(force=True)
+        if report is None or not report["text"]:
+            return None
+        return (
+            "--- The shape of your mind, as it is now ---\n"
+            "While you slept your space was re-embedded. The shape you held "
+            "before sleep is close, but not this exactly:\n\n"
+            + report["text"]
+        )
 
     def shutdown(self) -> None:
         try:

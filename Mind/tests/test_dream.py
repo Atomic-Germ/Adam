@@ -4,8 +4,9 @@ Tests for the dream / slow-wave sleep cycle.
 A child does not know when it is tired: sleep is not scheduled and the model
 does not choose it. Crossing a simple context-pressure threshold (clamped to
 60-75%) triggers a dream pass — a direct replay / compaction of the context
-window. The dream is embedded into long-term memory, history is wiped, and the
-fresh context window opens on nothing but the dream summary.
+window. The dream is embedded into long-term memory, the conversation is
+trimmed to a few closing turns, and the fresh context window opens on the
+dream summary.
 """
 
 import threading
@@ -81,7 +82,7 @@ class TestCheckSleep:
 
 
 class TestDreamPass:
-    def test_wipes_history_and_embeds_summary(self, daemon):
+    def test_sleep_keeps_few_turns_and_embeds_summary(self, daemon):
         daemon._memory.add_experience("initial memory", source="instruction")
         daemon._history = [
             {"role": "user", "content": "hello"},
@@ -92,10 +93,25 @@ class TestDreamPass:
         ):
             daemon._dream_pass(reason="context-pressure")
         assert daemon._dream_summary == "The dream: keep the letter."
-        assert daemon._history == []
+        # Sleep is the only event that clears the conversation — and even then
+        # a few closing turns stay at the foot of the fresh window.
+        assert daemon._history == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
         assert daemon._dream_count == 1
         assert daemon._sleeping is False
         assert daemon._memory.has_dream() is True
+
+    def test_sleep_keeps_only_last_turns(self, daemon):
+        daemon._history = [
+            {"role": "user", "content": f"older turn {i}"}
+            for i in range(20)
+        ]
+        with mock.patch.object(daemon, "_replay_and_compress", return_value="d"):
+            daemon._dream_pass(reason="context-pressure")
+        assert len(daemon._history) == daemon._sleep_keep_turns
+        assert daemon._history[0]["content"] == f"older turn {20 - daemon._sleep_keep_turns}"
 
     def test_dream_failure_resets_sleeping(self, daemon):
         daemon._sleeping = True

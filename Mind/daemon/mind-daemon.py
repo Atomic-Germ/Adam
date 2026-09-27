@@ -47,6 +47,7 @@ import subprocess
 import threading
 import datetime
 from pathlib import Path
+from typing import Optional
 
 from gi.repository import GLib
 from pydbus import SessionBus
@@ -91,6 +92,13 @@ SLEEP_CTX_PCT_MAX = 75
 # Minimum turns before we may dream (a degree-granting gate so a brand-new
 # window does not immediately trigger a dream).
 DEFAULT_SLEEP_MIN_TURNS = 6
+
+# Turns kept at the foot of the window after a dream (the conversation is
+# only ever cleared by sleep — and even then a few turns stay).
+DEFAULT_SLEEP_KEEP_TURNS = 4
+
+# History persistence: the conversation survives interface/dæmon restarts.
+HISTORY_FILE = str(Path.home() / ".local" / "share" / "mind" / "history.json")
 
 # Default context window (tokens). Honoured from the extension's ctx_size.
 DEFAULT_CTX_SIZE = 8192
@@ -204,6 +212,10 @@ class BubbleDaemon:
 
         # Rolling conversation history.
         self._history: list[dict] = []
+        self._history_path = Path(
+            os.environ.get("MIND_HISTORY_FILE", HISTORY_FILE)
+        )
+        self._load_history()
         self._summarizing = False
 
         # Sleep / dream. NOT scheduled and NOT chosen by the model — a simple
@@ -215,10 +227,16 @@ class BubbleDaemon:
         self._sleep_min_turns = int(
             os.environ.get("MIND_SLEEP_MIN_TURNS", DEFAULT_SLEEP_MIN_TURNS)
         )
+        self._sleep_keep_turns = int(
+            os.environ.get("MIND_SLEEP_KEEP_TURNS", DEFAULT_SLEEP_KEEP_TURNS)
+        )
         self._sleeping = False
         self._dream_summary = ""
         self._dream_count = 0
         self._last_dream_time = 0.0
+        self._wake_shape_note: Optional[str] = None
+        # Shape floor plan the clock tick last surfaced ('' = never).
+        self._surfaced_shape_fp: str = ""
 
         # Memory / embeddings (Arthur pieces now live here).
         self._memory = None
@@ -270,6 +288,7 @@ class BubbleDaemon:
             self._history.append({"role": "user", "content": message})
             self._last_user_time = time.monotonic()
             self._trim_history()
+            self._save_history()
         threading.Thread(
             target=self._stream, args=(token, message), daemon=True,
             name="mind-stream",
@@ -294,6 +313,7 @@ class BubbleDaemon:
     def ClearHistory(self) -> str:
         with self._lock:
             self._history.clear()
+            self._save_history()
         log.info("History cleared")
         return "ok"
 
@@ -301,11 +321,52 @@ class BubbleDaemon:
         with self._lock:
             return json.dumps(self._history)
 
+    def _load_history(self) -> None:
+        """Restore the conversation from disk (it survives daemon restarts)."""
+        try:
+            if self._history_path and self._history_path.exists():
+                raw = self._history_path.read_text(encoding="utf-8")
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    kept = []
+                    for m in data:
+                        if isinstance(m, dict) and m.get("role") in (
+                            "user", "assistant",
+                        ):
+                            content = m.get("content") or ""
+                            if isinstance(content, str):
+                                kept.append({"role": m["role"], "content": content})
+                    self._history = kept[:MAX_HISTORY_TURNS]
+                    if kept:
+                        log.info("History restored: %d turns from %s",
+                                 len(kept), self._history_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not restore history (%s); starting fresh", exc)
+            self._history = []
+
+    def _save_history(self) -> None:
+        """Persist the rolling conversation (small, atomic, best-effort)."""
+        if not self._history_path:
+            return
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._history_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._history[-MAX_HISTORY_TURNS:], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(self._history_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not save history: %s", exc)
+
     def TriggerNudge(self) -> str:
         """Manual clock tick. Returns a fresh token."""
         token = str(time.monotonic())
         GLib.idle_add(self.NudgeStart, token, "manual", 0)
-        GLib.idle_add(lambda: self._clock_tick(token, 0))
+        threading.Thread(
+            target=self._clock_tick, args=(token, 0), daemon=True,
+            name="mind-clock-tick-manual",
+        ).start()
         return token
 
     def Ping(self) -> str:
@@ -334,8 +395,9 @@ class BubbleDaemon:
 
     def _stream(self, token: str, message: str = "") -> None:
         """Stream an SSE reply from llama.cpp and commit clean text."""
+        wake_note = self._take_wake_shape_note()
         with self._lock:
-            snapshot = [{"role": "system", "content": self._build_system_content(message)}]
+            snapshot = [{"role": "system", "content": self._build_system_content(message, wake_note)}]
             snapshot.extend(self._history)
         model = self._auto_model()
         url = f"{LLM_BASE}/v1/chat/completions"
@@ -398,6 +460,7 @@ class BubbleDaemon:
             self._history.append({"role": "assistant", "content": clean_text})
             self._last_assistant_time = time.monotonic()
             self._trim_history()
+            self._save_history()
 
         self._index_exchange(user_message, clean_text)
         self._check_sleep()
@@ -499,17 +562,52 @@ class BubbleDaemon:
             self._last_dream_time = time.monotonic()
             self._dream_count += 1
             self._dream_summary = summary
-            self._history.clear()
+            # Sleep is the only event that clears the conversation — and even
+            # then a few closing turns stay at the foot of the fresh window.
+            keep = max(0, self._sleep_keep_turns)
+            self._history = self._history[-keep:] if keep else []
             self._sleeping = False
+            self._save_history()
         try:
             if self._memory is not None:
                 self._memory.add_dream(summary)
         except Exception as exc:  # noqa: BLE001
             log.warning("Dream embed/storage failed: %s", exc)
 
-        log.info("Dream done  reason=%s  summary_chars=%d  context_wiped -> fresh",
-                 reason, len(summary))
+        # One-shot waking awareness: surface the memory space's shape to the
+        # model on its first input after waking. The shape is one thing before
+        # sleep; selection and embedding happen while asleep; the context is
+        # wiped. The mismatch between the remembered shape and the now-shape
+        # is where dreams really live.
+        self._stamp_wake_shape(reason)
+
+        log.info("Dream done  reason=%s  summary_chars=%d  "
+                 "context -> fresh (kept %d turns)",
+                 reason, len(summary), keep)
         GLib.idle_add(self._set_status, "waking", "fresh context, only the dream")
+
+    def _stamp_wake_shape(self, reason: str) -> None:
+        """Snapshot the freshly-embedded memory space for the first waking input.
+
+        Runs on the mind-dream thread (never the GLib main loop). The shape is
+        recomputed against the store that now includes the dream summary; the
+        note is then consumed once by the next real user input.
+        """
+        try:
+            if self._memory is None:
+                return
+            note = self._memory.wake_shape_note()
+            with self._lock:
+                self._wake_shape_note = note
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Wake shape capture failed: %s", exc)
+
+    def _take_wake_shape_note(self) -> Optional[str]:
+        """Return and clear the one-shot waking shape note (if any)."""
+        with self._lock:
+            note = self._wake_shape_note
+            self._wake_shape_note = None
+        return note
 
     def _replay_and_compress(self, reason: str) -> str:
         """Non-streaming dream: model compresses its own context window."""
@@ -642,13 +740,29 @@ class BubbleDaemon:
             f"The user has been quiet for {idle_minutes} minute"
             f"{'s' if idle_minutes != 1 else ''}."
         )
+        floor_plan = ""
+        if self._memory is not None:
+            try:
+                # Refresh the floor plan on this daemon thread (never the
+                # GLib loop); surface it again only when the shape moved.
+                self._memory.shape_report()
+                fp = self._memory.shape_fp()
+                if fp and fp != self._surfaced_shape_fp:
+                    self._surfaced_shape_fp = fp
+                    floor_plan = self._memory.shape_text() or ""
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Clock-tick shape refresh failed: %s", exc)
         clock_tick_msg = (
             f"[Clock tick — {now_str}. {idle_note}\n\n"
-            f"Orient to immediate reality first: your context window, and the "
-            f"current idle phase. If you choose to speak, prefer one concrete "
+            f"Orient to immediate reality first: your context window, the "
+            f"current idle phase"
+            + (", and the shape of your space" if floor_plan else "")
+            + ". If you choose to speak, prefer one concrete "
             f"observation over meta-commentary about silence. You are not "
             f"required to speak.]"
         )
+        if floor_plan:
+            clock_tick_msg += "\n\n" + floor_plan
         snapshot.append({"role": "user", "content": clock_tick_msg})
         payload = {"model": model, "messages": snapshot, "stream": True, "max_tokens": 300}
         try:
@@ -675,7 +789,7 @@ class BubbleDaemon:
     # ------------------------------------------------------------------
     # The MX: system-prompt framing + live context/telemetry
     # ------------------------------------------------------------------
-    def _build_system_content(self, message: str = "") -> str:
+    def _build_system_content(self, message: str = "", wake_note: Optional[str] = None) -> str:
         parts = []
         if self._system_prompt:
             parts.append(self._system_prompt)
@@ -689,6 +803,9 @@ class BubbleDaemon:
                 "context window you fell asleep holding.\n\n"
                 + dream_summary
             )
+        if wake_note:
+            # One-shot, consumed only by the first input after waking.
+            parts.append(wake_note)
         mem_block = None
         if self._memory is not None:
             try:
@@ -707,6 +824,12 @@ class BubbleDaemon:
         if tel.get("mem_nodes", 0) > 0:
             lines.append(f"Memory: {tel['mem_nodes']} nodes "
                          f"({tel['mem_backend']}).")
+            try:
+                shape_line = self._memory.shape_line()
+                if shape_line:
+                    lines.append(shape_line)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Shape line failed: %s", exc)
         if tel.get("dream_count", 0) > 0:
             lines.append(f"Dreams slept: {tel['dream_count']} "
                          f"(pressure threshold {int(tel['sleep_ctx_pct'])}%).")

@@ -266,6 +266,7 @@ export default class MindExtension extends Extension {
                 this._pushSystemPrompt(false);
                 this._pushNudgeConfig();
                 this._setStatus('hanging-out', 'idle');
+                this._restoreHistory();
                 this._settingsChanged = this.getSettings().connect(
                     'changed',
                     (settings, key) => {
@@ -651,6 +652,36 @@ export default class MindExtension extends Extension {
     _clearHistory() {
         this._proxy?.call('ClearHistory', null, Gio.DBusCallFlags.NONE, 2000, null, null);
         this._msgBox.get_children().forEach(c => c.destroy());
+    }
+
+    _restoreHistory() {
+        if (!this._proxy || !this._daemonHasOwner()) return;
+        // Skip if the window is mid-conversation (e.g. reconnect while open).
+        if (this._msgBox.get_children().length > 0) return;
+        this._proxy.call(
+            'GetHistory',
+            null,
+            Gio.DBusCallFlags.NONE,
+            2000,
+            null,
+            (source, result) => {
+                try {
+                    const raw = this._proxy.call_finish(result)[0] ?? '[]';
+                    const turns = JSON.parse(raw);
+                    if (!Array.isArray(turns) || turns.length === 0) return;
+                    for (const m of turns) {
+                        const role = m.role;
+                        const text = typeof m.content === 'string' ? m.content : '';
+                        if (role !== 'user' && role !== 'assistant') continue;
+                        if (!text.trim()) continue;
+                        this._addMessage(role, text);
+                    }
+                    this._scrollToBottom();
+                } catch (_e) {
+                    console.error('[Mind] History restore failed', _e);
+                }
+            },
+        );
     }
 
     _setStatus(state, detail = '') {

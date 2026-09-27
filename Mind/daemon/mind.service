@@ -26,6 +26,13 @@ Environment=MIND_MEMORY_CHUNK_OVERLAP=80
 # hashes so a similar situation resurfaces a similar (never identical) set.
 # Set MIND_MEMORY_FUZZY=0 to go back to strict relevance top-k.
 Environment=MIND_MEMORY_FUZZY=1
+# Shape awareness: the mind holds its own cached floor plan (naves, spires,
+# bridges, open space) in Current context; refreshed on clock ticks and
+# re-surfaced once after each dream when the space has been re-embedded.
+Environment=MIND_MEMORY_SHAPE=1
+# Sleep is the only event that clears the conversation — and even then a few
+# closing turns stay at the foot of the fresh window.
+Environment=MIND_SLEEP_KEEP_TURNS=4
 
 PassEnvironment=MIND_MODEL 
 # Identity/values framing sent as the system role (takes effect immediately).
