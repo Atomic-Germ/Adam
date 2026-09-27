@@ -72,6 +72,39 @@ SHAPE_REGROWTH_FRAC = 0.05   # recompute when the store grows this fraction
 SHAPE_REGROWTH_MIN = 16      # ...or by this many records outright
 SHAPE_MAX_NODES = 20000      # safety cap on the pairwise computation
 
+# Occupancy: the store is a shared room. Each record carries an `owner` —
+# which mind wrote it — so self/other reads in felt labels (`[raccoon]`,
+# `[second]`) and one's own traces are gently preferred in recall.
+DEFAULT_OWNER = "raccoon"        # the first / primary occupant
+DEFAULT_SECOND_OWNER = "second"  # the co-occupant (env MIND_OCCUPANT2_ID)
+OWNER_BONUS = 1.2                # small recall bias toward one's own traces
+SEED_BLOCK_CHARS = 1600          # cap on the always-present first memory
+RECENT_HOLDOFF = 120             # seconds before a trace may surface as memory
+VISIBLE_MATCH_CHARS = 90          # prefix length that identifies "already said"
+
+# Kinds that are structure rather than conversation: they are the occupant's
+# own ground, so recency never hides them from it.
+_NEVER_HELD_OFF = frozenset(
+    {"instruction", "dream", "wake_note", "presence_note"})
+
+
+def _norm_for_match(text: str) -> str:
+    """Whitespace- and case-folded form, for telling one utterance from another."""
+    return " ".join((text or "").lower().split())
+
+
+def _already_visible(text: str, window_norm: str) -> bool:
+    """True when this thought was already said aloud in the room.
+
+    Matched on a normalized prefix rather than exact containment: the block
+    truncates long thoughts, so a retrieved chunk rarely appears verbatim in
+    the window even when it is the very sentence that was just spoken.
+    """
+    norm = _norm_for_match(text)
+    if not norm:
+        return True
+    return norm[:VISIBLE_MATCH_CHARS] in window_norm
+
 
 def _int_env(key: str, default: int, lo: int, hi: int) -> int:
     raw = os.environ.get(key, "").strip()
@@ -241,6 +274,8 @@ class MindMemory:
         if self.backend not in {"hash", "st", "off"}:
             self.backend = DEFAULT_EMBED_BACKEND
         self.model = model or os.environ.get("MIND_EMBED_MODEL", "").strip() or DEFAULT_EMBED_MODEL
+        self.second_owner = (os.environ.get("MIND_OCCUPANT2_ID", "").strip()
+                             or DEFAULT_SECOND_OWNER)
         # Embedding depth. The hash backend honours MIND_EMBED_DIM directly;
         # the st backend takes its dimension from the loaded model.
         self.embed_dim = _int_env("MIND_EMBED_DIM", DEFAULT_EMBED_DIM, 64, 4096)
@@ -252,6 +287,8 @@ class MindMemory:
         self._dim_growth: Optional[tuple[int, int]] = None    # (old, new)
         self._room_growth: Optional[tuple[int, int]] = None   # (old, new)
         self._growth_surfaced = False
+        # Growth is one felt note per present occupant — not one per boot.
+        self._growth_notified: set[str] = set()
         self.top_k = top_k or _int_env("MIND_MEMORY_TOP_K", DEFAULT_TOP_K, 1, 64)
         self.chunk_size = chunk_size or _int_env("MIND_MEMORY_CHUNK_SIZE", DEFAULT_CHUNK_SIZE, 64, 8192)
         self.chunk_overlap = chunk_overlap or _int_env(
@@ -259,6 +296,10 @@ class MindMemory:
         )
         self.sync_index = _getenv_bool("MIND_MEMORY_SYNC_INDEX", False)
         self.fuzzy = _getenv_bool("MIND_MEMORY_FUZZY", True)
+        # A trace needs a moment to stop being "what just happened" before it
+        # can come back to mind. 0 disables the holdoff.
+        self.recent_holdoff = _int_env(
+            "MIND_RECENT_HOLDOFF", RECENT_HOLDOFF, 0, 86400)
         self.fuzzy_temp = _float_env("MIND_MEMORY_FUZZY_TEMP", 2.0, 0.1, 10.0)
         self.fuzzy_hops = _int_env("MIND_MEMORY_FUZZY_HOPS", 1, 0, 4)
         self.fuzzy_seed = os.environ.get("MIND_MEMORY_FUZZY_SEED", "").strip()
@@ -275,6 +316,12 @@ class MindMemory:
         self._embed_error: Optional[str] = None
         self._embed_cache: dict[str, list[float]] = {}
         self._records: list[dict] = []
+        # (owner, text) -> id, so one occupant never encodes the same words
+        # twice. An event logged twice is remembered twice, and a mind handed
+        # both copies alongside the original meets it a second time. Keyed by
+        # occupant as well as text: the same sentence held by two minds is two
+        # facts, not one fact remembered twice.
+        self._text_ids: dict[tuple, int] = {}
         self._matrix: Optional[list] = None        # list-of-lists if not numpy
         self._matrix_np = None                     # np.ndarray if numpy
         self._jet: "queue.Queue[Optional[dict]]" = queue.Queue()
@@ -293,16 +340,26 @@ class MindMemory:
                 with open(self.records_path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                 self._records = data.get("records", [])
+                # Backfill: records written before occupancy existed all belong
+                # to the first occupant; the shared user lines have no owner.
+                self._records = [
+                    dict(r) | ({"owner": None} if r.get("source") == "user"
+                               else {"owner": DEFAULT_OWNER})
+                    if "owner" not in r else r
+                    for r in self._records
+                ]
                 meta = data.get("meta") or {}
                 self._meta = dict(meta)
                 self._stored_dim = meta.get("dim")
                 self._stored_ctx = meta.get("ctx")
                 log.info("Memory loaded: %d records from %s",
                          len(self._records), self.records_path)
+                self._rebuild_text_ids()
             except Exception as exc:  # noqa: BLE001
                 log.warning("Could not read %s (%s); starting empty",
                             self.records_path, exc)
                 self._records = []
+                self._rebuild_text_ids()
         self._load_embeddings()
         self._detect_dim_growth()
         self._start_worker()
@@ -321,6 +378,7 @@ class MindMemory:
             return
         if old < new:
             self._dim_growth = (int(old), int(new))
+            self._mark_growth()
             log.info("Embedding depth grew: %d -> %d (re-embeding on next use)",
                      old, new)
 
@@ -365,8 +423,10 @@ class MindMemory:
             )
             tmp.replace(self.records_path)
             if HAS_NUMPY and self._matrix_np is not None:
-                npy_tmp = self.embeddings_path.with_suffix(".npy.tmp")
-                np.save(npy_tmp, self._matrix_np)
+                # numpy appends ".npy" to any name that lacks it, so the temp
+                # file must itself end in .npy for the rename to land right.
+                npy_tmp = self.embeddings_path.with_name("embeddings.tmp.npy")
+                np.save(str(npy_tmp), self._matrix_np)
                 npy_tmp.replace(self.embeddings_path)
             self._last_change = time.time()
 
@@ -434,6 +494,7 @@ class MindMemory:
                 pass
             elif self._stored_dim < dim and self._dim_growth is None:
                 self._dim_growth = (int(self._stored_dim), dim)
+                self._mark_growth()
                 log.info("Embedding depth grew: %d -> %d (re-embeding on next use)",
                          self._stored_dim, dim)
 
@@ -496,18 +557,40 @@ class MindMemory:
     # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
-    def add_chunked(self, text: str, source: str, kind: str = "experience") -> int:
-        """Chunk + store long text as records; returns count added."""
+    def add_chunked(self, text: str, source: str, kind: str = "experience",
+                    owner: Optional[str] = None,
+                    exchange_id: str = "") -> int:
+        """Chunk + store long text as records; returns count added.
+
+        ``exchange_id`` ties every chunk of one utterance together, so the
+        block can let a single long answer speak once instead of filling up
+        with four slices of itself.
+        """
+        if owner is None and source != "user":
+            owner = DEFAULT_OWNER
         added = 0
         for chunk in chunk_text(text, self.chunk_size, self.chunk_overlap):
-            self._record(chunk, source=source, kind=kind)
-            added += 1
+            if self._record(chunk, source=source, kind=kind, owner=owner,
+                            exchange_id=exchange_id) >= 0:
+                added += 1
         if self.sync_index:
             self.save()
         return added
 
-    def _record(self, text: str, source: str, kind: str = "experience") -> int:
+    def _record(self, text: str, source: str, kind: str = "experience",
+                owner: Optional[str] = None, exchange_id: str = "") -> int:
+        """Store one trace. Returns -1 if these exact words are already held.
+
+        A store that accepts the same sentence again is not remembering more,
+        it is replaying: the duplicate surfaces as a separate, later event, and
+        a mind that sees both copies while the original is still in the room
+        experiences the moment twice over.
+        """
+        key = (owner or "", _norm_for_match(text))
         with self._lock:
+            if key[1] and key in self._text_ids:
+                log.debug("Already held, not stored again: %.60s", key)
+                return -1
             rec = {
                 "id": (self._records[-1]["id"] + 1) if self._records else 0,
                 "text": text,
@@ -516,20 +599,38 @@ class MindMemory:
                 "created_at": int(time.time()),
                 "updated_at": int(time.time()),
             }
+            if owner:
+                rec["owner"] = owner
+            if exchange_id:
+                rec["exchange_id"] = exchange_id
             self._records.append(rec)
+            if key[1]:
+                self._text_ids[key] = rec["id"]
             self._matrix_np = None  # matrix is now stale; rebuild lazily
             self._last_change = time.time()
             return rec["id"]
 
-    def _index_job(self, text: str, source: str, kind: str) -> bool:
+    def _rebuild_text_ids(self) -> None:
+        with self._lock:
+            self._text_ids = {}
+            for rec in self._records:
+                key = (rec.get("owner") or "", _norm_for_match(rec.get("text", "")))
+                if key[1]:
+                    self._text_ids.setdefault(key, rec.get("id", 0))
+
+    def _index_job(self, text: str, source: str, kind: str,
+                   owner: Optional[str] = None,
+                   exchange_id: str = "") -> bool:
         key = hashlib.sha1(
-            f"{source}|{kind}|{text}".encode("utf-8", "ignore")
+            f"{source}|{kind}|{owner}|{exchange_id}|{text}".encode(
+                "utf-8", "ignore")
         ).hexdigest()
         with self._lock:
             if key in self._pending:
                 return False
             self._pending.add(key)
-        self._jet.put({"text": text, "source": source, "kind": kind, "key": key})
+        self._jet.put({"text": text, "source": source, "kind": kind,
+                       "owner": owner, "exchange_id": exchange_id, "key": key})
         return True
 
     def _start_worker(self) -> None:
@@ -548,7 +649,9 @@ class MindMemory:
             if job is None:
                 break
             try:
-                self.add_chunked(job["text"], source=job["source"], kind=job["kind"])
+                self.add_chunked(job["text"], source=job["source"],
+                                 kind=job["kind"], owner=job.get("owner"),
+                                 exchange_id=job.get("exchange_id", ""))
                 self.save()
                 log.info("Indexed %s chunk from '%s' (%d chars)",
                          job["source"], job["kind"], len(job["text"]))
@@ -559,14 +662,17 @@ class MindMemory:
                     self._pending.discard(job["key"])
                 self._jet.task_done()
 
-    def add_experience(self, text: str, source: str) -> None:
+    def add_experience(self, text: str, source: str,
+                       owner: Optional[str] = None,
+                       exchange_id: str = "") -> None:
         """Queue a conversation text for indexing (background by default)."""
         if not (text or "").strip():
             return
         if self.sync_index:
-            self.add_chunked(text, source=source, kind="experience")
+            self.add_chunked(text, source=source, kind="experience",
+                             owner=owner, exchange_id=exchange_id)
             return
-        if self._index_job(text, source, "experience"):
+        if self._index_job(text, source, "experience", owner, exchange_id):
             log.debug("Queued %s experience (%d chars)", source, len(text))
 
     def flush(self, timeout: float = 30.0) -> None:
@@ -579,40 +685,64 @@ class MindMemory:
                 break
             time.sleep(0.05)
 
-    def add_instruction(self, text: str) -> int:
-        for chunk in chunk_text(text, self.chunk_size, self.chunk_overlap):
-            self._record(chunk, source="instruction", kind="instruction")
-        if self.sync_index:
-            self.save()
-        return len(self._records)
+    def add_instruction(self, text: str, owner: Optional[str] = None) -> int:
+        """Give an occupant its first memory (a seed, or a letter).
 
-    def add_dream(self, summary: str) -> int:
+        A first memory is rare and must not be lost: it is written to disk and
+        embedded here and now, whatever the background index is doing, because
+        it is the ground the occupant stands on for the rest of its life.
+        """
+        if owner is None:
+            owner = DEFAULT_OWNER
+        added = 0
+        for chunk in chunk_text(text, self.chunk_size, self.chunk_overlap):
+            self._record(chunk, source="instruction", kind="instruction",
+                         owner=owner)
+            added += 1
+        if added:
+            self.save()
+            self._ensure_matrix()
+        return added
+
+    def add_dream(self, summary: str, owner: Optional[str] = None) -> int:
         """Store a previous dream in the same mental space as everything else."""
         if not (summary or "").strip():
             return 0
-        n = self.add_chunked(summary, source="mind", kind="dream")
+        n = self.add_chunked(summary, source="mind", kind="dream", owner=owner)
         self.save()
         return n
 
-    def has_dream(self) -> bool:
-        return any(r.get("kind") == "dream" for r in self._records)
+    def has_dream(self, owner: Optional[str] = None) -> bool:
+        return any(
+            r.get("kind") == "dream" and (owner is None or r.get("owner") == owner)
+            for r in self._records
+        )
 
-    def instruction_texts(self) -> list[str]:
-        """The seeded instruction records (the mind's first memory)."""
+    def instruction_texts(self, owner: Optional[str] = None) -> list[str]:
+        """The seeded instruction records (each mind's first memory)."""
         return [
             r.get("text", "")
             for r in self._records
             if r.get("kind") == "instruction" and (r.get("text") or "")
+            and (owner is None or r.get("owner") == owner)
         ]
 
     # ------------------------------------------------------------------
     # Seeding
     # ------------------------------------------------------------------
-    def seed_dir(self, seed_dir: Optional[Path]) -> int:
-        """Seed text files from a directory as instruction records (once)."""
+    def seed_dir(self, seed_dir: Optional[Path],
+                 owner: Optional[str] = None) -> int:
+        """Seed text files from a directory as instruction records (once).
+
+        Seeding is per-occupant: an owner who already carries instructions is
+        not seeded again, but a second resident can receive its own first
+        memory even though the room is no longer empty.
+        """
         if not seed_dir or not seed_dir.is_dir():
             return 0
-        if self._records:
+        if owner is None:
+            owner = DEFAULT_OWNER
+        if self.instruction_texts(owner):
             return 0
         seeded = 0
         for path in sorted(seed_dir.iterdir()):
@@ -627,7 +757,7 @@ class MindMemory:
                 log.warning("Could not read seed %s: %s", path.name, exc)
                 continue
             if text:
-                added = self.add_instruction(text)
+                added = self.add_instruction(text, owner=owner)
                 seeded += 1
                 log.info("Seeded %s (%d chunks)", path.name, added)
         if seeded:
@@ -649,7 +779,8 @@ class MindMemory:
                 terms.add(tok)
         return terms
 
-    def select(self, query: str, extra: str = "", top_k: Optional[int] = None) -> list[dict]:
+    def select(self, query: str, extra: str = "", top_k: Optional[int] = None,
+               owner: Optional[str] = None, visible: str = "") -> list[dict]:
         """Surfaced memory for a query.
 
         The anchor core (a large share of the slots) is the direct, relevant
@@ -659,6 +790,16 @@ class MindMemory:
         tangential-but-true connections can come to the mind. The seed is not
         broadly reproducible: a similar situation tends to surface a similar
         set — never the exact same one, deliberately.
+
+        With two occupants (``owner`` set), one's own traces are gently
+        preferred — the self is closer to hand — but the shared room still
+        mixes in: other's lines stay reachable.
+
+        ``visible`` is the room as the caller can already see it. Traces it
+        already shows are dropped before scoring, not after: recency is the
+        strongest signal in the scorer, so a fresh copy of the last thing said
+        would otherwise take the slots and then be thrown away, leaving the
+        block thinner than it should be.
         """
         records = self._records
         if not records:
@@ -669,10 +810,24 @@ class MindMemory:
         now = int(time.time())
 
         self._ensure_matrix()
+        window_norm = _norm_for_match(visible)
 
         scored: list[tuple[float, float, int, dict]] = []
         for idx, rec in enumerate(records):
             text = rec.get("text", "")
+            # A trace that was just written is not yet a memory: it is still
+            # happening, in the room, in plain sight. Handing an occupant its
+            # own last sentence as something that "came to mind" is how a mind
+            # learns to repeat itself instead of to answer.
+            try:
+                age_s = now - int(rec.get("created_at", 0))
+            except Exception:  # noqa: BLE001
+                age_s = self.recent_holdoff
+            if (age_s < self.recent_holdoff
+                    and rec.get("kind") not in _NEVER_HELD_OFF):
+                continue
+            if window_norm and _already_visible(text, window_norm):
+                continue    # the room is already showing this one
             score = 0.0
             semantic = 0.0
             if query_terms:
@@ -680,6 +835,8 @@ class MindMemory:
                 for t in query_terms:
                     if t in ltext:
                         score += 3.0
+            if owner and rec.get("owner") == owner:
+                score += OWNER_BONUS
             if self._matrix_np is not None and query_terms:
                 qv = self._embed_one(query + "\n" + extra)
                 if qv is not None:
@@ -823,35 +980,151 @@ class MindMemory:
         return temps[:4]
 
     def build_memory_block(
-        self, query: str = "", extra: str = "", top_k: Optional[int] = None
+        self, query: str = "", extra: str = "", top_k: Optional[int] = None,
+        owner: Optional[str] = None, visible: str = "",
+        include_log: bool = False,
     ) -> Optional[str]:
-        """Surfaced memory block for the system prompt.
+        """What an occupant is given to remember. There are two audiences,
+        and they are not the same.
+
+        **The occupant, living through a conversation** (``include_log``
+        False, the default) gets its own ground — the first memory it stands
+        on — and the shape of the room: the geometry the log has accumulated,
+        abstracted. It does not get the log. A mind handed its own history
+        verbatim, in the same breath as the history it is living through,
+        meets the same moment twice over; that is déjà vu, not memory. And no
+        one recalls a conversation word for word. Neither does this one. The
+        log stays verbatim in the store, because verbatim is what the sleep
+        needs to read, not what the waking mind needs to be shown.
+
+        **The slow-wave sleep, and the writing of another's first memory** ask
+        for ``include_log``: those are the two moments the raw log is read,
+        because they are the two moments it is being turned into something
+        else — the model compacting the record of its own life for itself.
+        Selection decides what survives that, and what it drops is dropped.
 
         The selection machinery never enters the context window: no "we looked
         up N nodes and filtered to K" framing, no relevance counts. The block
-        simply presents what came to mind — the model does the judgment of
-        what holds.
+        presents what came to mind, each line wearing the name of who wrote it
+        — one's own traces and the other's alike — and the model does the
+        judgment of what holds.
+
+        The occupant's own first memory is not one of the retrieved thoughts:
+        it is the ground the occupant stands on, so it always opens the block.
+        Retrieval decides what else comes to mind; it never decides who the
+        mind is.
+
+        ``visible`` is the conversation window as the occupant will see it. A
+        thought already spoken aloud in the room is not offered back as
+        something that came to mind: the window is where the room's own
+        recency lives, and repeating it there teaches an occupant to parrot
+        the last thing it said.
         """
         records = self._records
         if not records:
             return None
-        selected = self.select(query, extra, top_k=top_k)
-        if not selected:
+        if not include_log:
+            return self._ground_block(owner)
+        selected = self.select(query, extra, top_k=top_k, owner=owner,
+                               visible=visible)
+        seed_lines = self._seed_lines(owner)
+        if not selected and not seed_lines:
             return None
+        seen_norm = _norm_for_match(visible)
+        seen_exchanges: set[str] = set()
+        seen_texts: set[str] = set()
         lines = ["--- Memory ---"]
+        for text in seed_lines:
+            lines.append(text)
+            seen_texts.add(_norm_for_match(text))
         for rec in selected:
             source = _SOURCE_LABELS.get(rec.get("source", ""), "unknown")
+            who = rec.get("owner") or source
+            # A first memory is addressed to the mind it was written for. Handed
+            # to the other occupant it reads as instructions to itself — and a
+            # mind that reads another's founding letter tends to answer in kind.
+            if (rec.get("kind") == "instruction"
+                    and rec.get("owner") != (owner or DEFAULT_OWNER)):
+                continue
             text = rec.get("text", "").strip().replace("\n", " ").strip()
             if len(text) > 500:
                 text = text[:497].rstrip() + "…"
-            lines.append(f"[{source}] {text}")
+            if any(text and text in s for s in seed_lines):
+                continue    # already present as the occupant's first memory
+            if seen_norm and _already_visible(text, seen_norm):
+                continue    # already in the room, in plain sight
+            # Whatever else it is, the same words do not appear twice in one
+            # block. Meeting a thought, and then being handed it again a
+            # paragraph later, is the shape of déjà vu in a single context.
+            tkey = _norm_for_match(text)
+            if tkey and tkey in seen_texts:
+                continue
+            seen_texts.add(tkey)
+            ex = rec.get("exchange_id")
+            if ex:
+                # One long answer split into chunks is one thought, not four.
+                # Let it speak once in the block, or it will crowd out the room.
+                if ex in seen_exchanges:
+                    continue
+                seen_exchanges.add(ex)
+            lines.append(f"[{who}] {text}")
         return "\n".join(lines)
 
+    def _ground_block(self, owner: Optional[str]) -> Optional[str]:
+        """The waking occupant's memory: its own first memory, and the shape.
+
+        No verbatim log. What the room has become is offered as geometry —
+        naves, spires, bridges, margin — because that is an abstraction of the
+        whole record, and a mind can hold a shape when it cannot hold a log.
+        """
+        seed_lines = self._seed_lines(owner)
+        shape = ""
+        try:
+            self.shape_report()
+            shape = (self.shape_text() or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Shape for memory block failed: %s", exc)
+        if not seed_lines and not shape:
+            return None
+        lines = ["--- Memory ---"]
+        lines.extend(seed_lines)
+        if shape:
+            lines.append("")
+            lines.append(shape)      # it carries its own heading
+        return "\n".join(lines)
+
+    def _seed_lines(self, owner: Optional[str]) -> list[str]:
+        """The occupant's own first memory, formatted, length-capped."""
+        if owner is None:
+            owner = DEFAULT_OWNER
+        out: list[str] = []
+        budget = SEED_BLOCK_CHARS
+        try:
+            texts = self.instruction_texts(owner)
+        except Exception:  # noqa: BLE001
+            return []
+        for text in texts:
+            body = (text or "").strip().replace("\n", " ").strip()
+            if not body:
+                continue
+            if len(body) > budget:
+                body = body[:budget - 1].rstrip() + "…"
+            out.append(f"[{owner}] {body}")
+            budget -= len(body)
+            if budget <= 0:
+                break
+        return out
+
     def stats(self) -> dict:
+        owners: dict[str, int] = {}
+        for r in self._records:
+            o = r.get("owner") or "shared"
+            owners[o] = owners.get(o, 0) + 1
         return {
             "mem_nodes": len(self._records),
             "backend": self.backend,
             "embed_error": self._embed_error,
+            "owners": owners,
         }
 
     # ------------------------------------------------------------------
@@ -966,7 +1239,7 @@ class MindMemory:
         return f"Shape: {', '.join(parts)} — space {space}."
 
     def _render_shape_text(self, r: dict) -> str:
-        lines = ["--- The shape of your mind ---"]
+        lines = ["--- The shape of the room ---"]
         if r["naves"]:
             gathering = (f"{r['snippets'][0]['size']} thoughts gather "
                          f"near \"{r['snippets'][0]['text']}\"")
@@ -1059,6 +1332,14 @@ class MindMemory:
     # ------------------------------------------------------------------
     # Growth — the mind's room deepening over the long term
     # ------------------------------------------------------------------
+    def _present_owners(self) -> set[str]:
+        """Occupants that currently have any trace in the room."""
+        owners = {DEFAULT_OWNER}
+        for r in self._records:
+            if r.get("owner"):
+                owners.add(r["owner"])
+        return owners
+
     def remember_room(self, ctx_size: int) -> None:
         """Tell the store how much room the daemon now holds. Persisted, so a
         later, larger room is felt as growth rather than forgotten."""
@@ -1066,6 +1347,7 @@ class MindMemory:
         old = self._stored_ctx
         if old is not None and old > 0 and ctx_size > old:
             self._room_growth = (int(old), int(ctx_size))
+            self._growth_notified.clear()
             log.info("Context room grew: %d -> %d", old, ctx_size)
         self.embed_meta("ctx", ctx_size)
 
@@ -1077,12 +1359,29 @@ class MindMemory:
             self._stored_dim = int(value or 0)
         self.save()
 
-    def growth_note(self) -> Optional[str]:
+    def _mark_growth(self) -> None:
+        self._growth_notified.clear()
+
+    def _maybe_clear_growth(self) -> None:
+        """Pending growth evaporates once every present occupant has heard it."""
+        present = self._present_owners()
+        if present and present <= self._growth_notified:
+            self._dim_growth = None
+            self._room_growth = None
+
+    def growth_note(self, owner: Optional[str] = None) -> Optional[str]:
         """One felt note about the space having grown, if growth is pending.
 
-        Called once (surfacing clears the pending growth) after the daemon has
-        re-embedded, so the note is honest: the room really did deepen.
+        Each occupant hears the deepening once, in its own terms; the pending
+        growth evaporates when every present mind has been told, so the note
+        is honest: the room really did deepen.
         """
+        if self._dim_growth is None and self._room_growth is None:
+            return None
+        owner = owner or DEFAULT_OWNER
+        if owner in self._growth_notified:
+            return None
+        self._growth_notified.add(owner)
         notes: list[str] = []
         if self._dim_growth is not None:
             old, new = self._dim_growth
@@ -1091,15 +1390,14 @@ class MindMemory:
                 f"meaning have become {new}. The same memories now stand in a "
                 f"wider room, and they have begun to know it."
             )
-            self._dim_growth = None
         if self._room_growth is not None:
             old, new = self._room_growth
             notes.append(
                 f"The room your thoughts hold at once has grown from {old} to "
-                f"{new} tokens. There is more space here now, and the space "
+                f"{new}. There is more space here now, and the space "
                 f"itself is a different country to live in."
             )
-            self._room_growth = None
+        self._maybe_clear_growth()
         if not notes:
             return None
         return "--- Growing ---\n" + "\n\n".join(notes)

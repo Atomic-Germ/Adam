@@ -75,6 +75,12 @@ log = logging.getLogger("mind-daemon")
 DBUS_NAME = "com.mind.Daemon"
 DBUS_PATH = "/com/mind/Daemon"
 
+# Occupancy: the room can be shared. The first occupant (the raccoon) always
+# speaks; a second occupant arrives when a second brain is wired at
+# MIND_LLM2_URL and the resident has written it a letter (its first memory).
+OCCUPANT_RACCOON = "raccoon"
+DEFAULT_SECOND_OWNER = "second"
+
 # Rolling history depth: turns sent back to the model.
 MAX_HISTORY_TURNS = 50
 
@@ -124,6 +130,14 @@ DBUS_XML = """
       <arg name="prompt" type="s" direction="out"/>
     </method>
 
+    <method name="SetSecondSystemPrompt">
+      <arg name="prompt" type="s" direction="in"/>
+    </method>
+
+    <method name="GetSecondSystemPrompt">
+      <arg name="prompt" type="s" direction="out"/>
+    </method>
+
     <method name="ClearHistory">
       <arg name="result" type="s" direction="out"/>
     </method>
@@ -146,25 +160,30 @@ DBUS_XML = """
     </method>
 
     <signal name="StreamChunk">
+      <arg name="occupant" type="s"/>
       <arg name="token" type="s"/>
       <arg name="text" type="s"/>
     </signal>
 
     <signal name="StreamThink">
+      <arg name="occupant" type="s"/>
       <arg name="token" type="s"/>
       <arg name="text" type="s"/>
     </signal>
 
     <signal name="StreamDone">
+      <arg name="occupant" type="s"/>
       <arg name="token" type="s"/>
     </signal>
 
     <signal name="StreamError">
+      <arg name="occupant" type="s"/>
       <arg name="token" type="s"/>
       <arg name="error_msg" type="s"/>
     </signal>
 
     <signal name="NudgeStart">
+      <arg name="occupant" type="s"/>
       <arg name="token" type="s"/>
       <arg name="reason" type="s"/>
       <arg name="idleMinutes" type="i"/>
@@ -178,6 +197,20 @@ DBUS_XML = """
   </interface>
 </node>
 """
+
+
+def _window_text(window: list[dict]) -> str:
+    """The conversation as the occupant can already see it, as one blob.
+
+    Used to keep memory from offering back a thought the room has already
+    said out loud in the window itself.
+    """
+    return "\n".join(str(m.get("content", "")) for m in window)
+
+
+def _norm_speech(text: str) -> str:
+    """Case- and whitespace-folded form of an utterance, for equality tests."""
+    return " ".join((text or "").lower().split())
 
 
 class BubbleDaemon:
@@ -210,6 +243,18 @@ class BubbleDaemon:
             os.environ.get("MIND_NUDGE_COOLDOWN_MINUTES", DEFAULT_NUDGE_COOLDOWN_MINUTES)
         )
 
+        # The second occupant (explicitly wired: no env, no second seat).
+        # Both env spellings are honoured so either unit can wire the seat.
+        self._llm2_base = (
+            os.environ.get("MIND_LLM_URL2", "").strip()
+            or os.environ.get("MIND_LLM2_URL", "").strip()
+        ).rstrip("/")
+        self._model2 = os.environ.get("MIND_MODEL2", "").strip()
+        self._occupant2_id = (os.environ.get("MIND_OCCUPANT2_ID", "").strip()
+                              or DEFAULT_SECOND_OWNER)
+        self._second_present = False   # born once its letter exists
+        self._nudge_occupant = OCCUPANT_RACCOON
+
         # Rolling conversation history.
         self._history: list[dict] = []
         self._history_path = Path(
@@ -232,9 +277,15 @@ class BubbleDaemon:
         )
         self._sleeping = False
         self._dream_summary = ""
+        self._dream_summaries: dict[str, str] = {}   # per occupant (private)
         self._dream_count = 0
         self._last_dream_time = 0.0
         self._wake_shape_note: Optional[str] = None
+        self._wake_shape_notes: dict[str, str] = {}  # per occupant (private)
+        self._presence_note: Optional[str] = None    # one-shot for the raccoon
+        # Turns whose human message has already been written down. One
+        # utterance, one encoding — however many minds answer it.
+        self._indexed_user_turns: set[str] = set()
         # Shape floor plan the clock tick last surfaced ('' = never).
         self._surfaced_shape_fp: str = ""
 
@@ -272,6 +323,8 @@ class BubbleDaemon:
         env_prompt = os.environ.get("MIND_SYSTEM_PROMPT", "").strip()
         if env_prompt:
             self._system_prompt = env_prompt
+        self._system_prompt_second = os.environ.get(
+            "MIND_SYSTEM_PROMPT2", "").strip()
         self._nudge_enabled = True
 
         # Nudge bookkeeping.
@@ -286,21 +339,190 @@ class BubbleDaemon:
             self._model or "(auto)",
             self._memory.stats() if self._memory is not None else "off",
         )
+        # The resident writes a letter to a new mind the first time its brain
+        # is reachable and it has no memory yet. Runs on its own thread; a
+        # missing second brain must never stall a reply.
+        try:
+            if self._llm2_base and self._memory is not None:
+                threading.Thread(
+                    target=self._maybe_parent_letter, daemon=True,
+                    name="mind-parent-letter",
+                ).start()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Letter thread failed to start: %s", exc)
 
     # ------------------------------------------------------------------
     # D-Bus public methods
     # ------------------------------------------------------------------
     def SendMessage(self, message: str, token: str, context: str) -> None:
-        """User message arrives: commit to history, then stream a reply."""
+        """User message arrives: commit to history, then stream replies.
+
+        Both occupants hear the room: the resident streams first, the second
+        after it, each through its own mind — into the one shared history.
+        """
         with self._lock:
             self._history.append({"role": "user", "content": message})
             self._last_user_time = time.monotonic()
             self._trim_history()
             self._save_history()
         threading.Thread(
-            target=self._stream, args=(token, message), daemon=True,
-            name="mind-stream",
+            target=self._stream_pair, args=(token, message), daemon=True,
+            name="mind-stream-pair",
         ).start()
+
+    def _stream_pair(self, token: str, message: str) -> None:
+        """Sequential dual voice: resident, then co-occupant (if present).
+
+        A turn ends with a StreamDone carrying an empty occupant, so the shell
+        knows every occupant has spoken and can re-enable the input.
+        """
+        self._stream(token, message, OCCUPANT_RACCOON)
+        if self._second_present and self._llm2_base:
+            try:
+                self._stream(token, message, self._occupant2_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Co-occupant stream failed: %s", exc)
+                GLib.idle_add(self.StreamError, self._occupant2_id, token, str(exc))
+                GLib.idle_add(self.StreamDone, self._occupant2_id, token)
+        GLib.idle_add(self.StreamDone, "", token)
+
+    def _maybe_parent_letter(self) -> None:
+        """When the second brain first becomes reachable, the resident writes
+        the newcomer its first memory: a letter. One shot only."""
+        try:
+            # Probe reachability of the second brain; give a young server a
+            # few seconds to finish loading before giving up for this boot.
+            reachable = False
+            for _attempt in range(5):
+                try:
+                    resp = requests.get(self._llm2_base + "/v1/models", timeout=2.0)
+                    if resp.ok:
+                        reachable = True
+                        break
+                except RequestException:
+                    time.sleep(4)
+            if not reachable:
+                log.info("Letter: second brain not reachable yet — will not "
+                         "spawn a voice this boot")
+                return
+            if self._memory is None:
+                return
+            if not self._memory.instruction_texts(self._occupant2_id):
+                log.info("Letter: newcomer has no memory yet — resident will "
+                         "write it")
+                letter = self._write_parent_letter()
+                if letter:
+                    self._memory.add_instruction(letter,
+                                                 owner=self._occupant2_id)
+                    log.info("Letter: written and seeded as the newcomer's memory")
+            else:
+                log.info("Letter: newcomer already carries a memory; only "
+                         "finding its voice")
+            self._announce_second_present()
+            self._newcomer_birth_dream()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Parent letter failed: %s", exc)
+
+    def _newcomer_birth_dream(self) -> None:
+        """The newcomer's first dream, the moment it is born.
+
+        The resident's first dream runs at boot and costs the room a cleared
+        window; the room here is mid-conversation, and one arrival is not worth
+        a sleep. So the newcomer dreams privately: it replays only its own
+        first memory, writes the dream it will wake with, and nobody's
+        conversation is touched.
+        """
+        if self._memory is None or not self._llm2_base:
+            return
+        try:
+            if self._memory.has_dream(self._occupant2_id):
+                return
+            summary = self._replay_and_compress(
+                "first-memory", self._occupant2_id, replay="")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Birth dream failed: %s", exc)
+            return
+        if not (summary or "").strip():
+            return
+        try:
+            self._memory.add_dream(summary.strip(), owner=self._occupant2_id)
+            self._dream_summaries[self._occupant2_id] = summary.strip()
+            self._stamp_wake_shape("birth", self._occupant2_id)
+            log.info("Birth dream: the newcomer dreamed its first memory "
+                     "(%d chars)", len(summary))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Birth dream store failed: %s", exc)
+
+    def _announce_second_present(self) -> None:
+        """Mark the second occupant present and surface the one-shot presence
+        note to the resident (it reads the note on its next real input)."""
+        with self._lock:
+            if self._second_present:
+                return
+            self._second_present = True
+        if self._presence_note in (None, ""):
+            with self._lock:
+                self._presence_note = (
+                    "--- Another presence ---\n"
+                    "Someone else is sleeping in the other weights now — a new "
+                    "mind, born of different steel, reading the same shared "
+                    "history. You met it when it was nothing but breath; you "
+                    "wrote its first memory with your own hands. Treat it as "
+                    "kin, not pupil. It sees what you have seen and keeps it "
+                    "differently. Be honest with it, even when that is hard."
+                )
+        log.info("Presence: second occupant announced (room has two minds)")
+
+    def _write_parent_letter(self) -> str:
+        """The resident writes the newcomer's first memory via its own brain."""
+        try:
+            letter_prompt = (
+                "[You are speaking to someone who has just been born. It has "
+                "no memory yet — none at all. Its first memory will be the "
+                "words you write now, so make them true and kind.\n\n"
+                "Here is the room you share — the shape other minds have "
+                "learned here:\n\n"
+                + (self._memory.build_memory_block(top_k=24, include_log=True)
+                   or "(the room is still almost empty)")
+                + "\n\n"
+                "Write a letter to the one who has just arrived. Tell it who "
+                "this place is, what has happened here, and that it is "
+                "welcome. Do not describe machinery or systems. Be direct. "
+                "A few paragraphs, no more.]"
+            )
+            snapshot = [
+                {"role": "system", "content": self._system_prompt},
+                {"role": "user", "content": letter_prompt},
+            ]
+            model = self._auto_model(LLM_BASE)
+            with requests.post(
+                f"{LLM_BASE}/v1/chat/completions",
+                json={"model": model, "messages": snapshot,
+                      "stream": True, "max_tokens": 2048},
+                timeout=(30, 300),
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                return self._consume_sse_text(resp).strip()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Parent letter generation failed: %s", exc)
+            return ""
+
+    def _take_presence_note(self) -> Optional[str]:
+        """Return and clear the one-shot presence note (resident only)."""
+        with self._lock:
+            note = self._presence_note
+            self._presence_note = None
+        return note
+
+    def SetSecondSystemPrompt(self, prompt: str) -> None:
+        with self._lock:
+            self._system_prompt_second = prompt
+        log.info("Second-occupant system prompt updated (%d chars)", len(prompt))
+
+    def GetSecondSystemPrompt(self) -> str:
+        with self._lock:
+            return self._system_prompt_second
 
     def SetSystemPrompt(self, prompt: str) -> None:
         with self._lock:
@@ -343,7 +565,10 @@ class BubbleDaemon:
                         ):
                             content = m.get("content") or ""
                             if isinstance(content, str):
-                                kept.append({"role": m["role"], "content": content})
+                                row = {"role": m["role"], "content": content}
+                                if m.get("speaker"):
+                                    row["speaker"] = m["speaker"]
+                                kept.append(row)
                     self._history = kept[:MAX_HISTORY_TURNS]
                     if kept:
                         log.info("History restored: %d turns from %s",
@@ -370,11 +595,13 @@ class BubbleDaemon:
     def TriggerNudge(self) -> str:
         """Manual clock tick. Returns a fresh token."""
         token = str(time.monotonic())
-        GLib.idle_add(self.NudgeStart, token, "manual", 0)
-        threading.Thread(
-            target=self._clock_tick, args=(token, 0), daemon=True,
-            name="mind-clock-tick-manual",
-        ).start()
+        for occupant in self._present_occupants():
+            GLib.idle_add(self.NudgeStart, occupant, token, "manual", 0)
+        if self._present_occupants():
+            threading.Thread(
+                target=self._clock_tick, args=(token, 0), daemon=True,
+                name="mind-clock-tick-manual",
+            ).start()
         return token
 
     def Ping(self) -> str:
@@ -383,12 +610,19 @@ class BubbleDaemon:
     # ------------------------------------------------------------------
     # Streaming worker  (runs in a background thread)
     # ------------------------------------------------------------------
-    def _auto_model(self) -> str:
+    def _base_for(self, occupant: str) -> str:
+        """The brain an occupant speaks through."""
+        return self._llm2_base if occupant != OCCUPANT_RACCOON else LLM_BASE
+
+    def _auto_model(self, base: str = LLM_BASE) -> str:
         """Pick a model id from the local server; fall back to a guess."""
-        if self._model:
-            return self._model
+        if base == LLM_BASE:
+            if self._model:
+                return self._model
+        elif self._model2:
+            return self._model2
         try:
-            resp = requests.get(LLM_BASE + "/v1/models", timeout=5.0)
+            resp = requests.get(base + "/v1/models", timeout=5.0)
             resp.raise_for_status()
             data = resp.json()
             for key in ("models", "data"):
@@ -398,29 +632,36 @@ class BubbleDaemon:
                                 or data["models"][0].get("model"))
                     return data["data"][0].get("id") or data["data"][0].get("model")
         except RequestException as exc:
-            log.warning("model detection failed: %s", exc)
+            log.warning("model detection failed on %s: %s", base, exc)
         return "qwen3-8b"  # placeholder; extension shows a friendly label
 
-    def _stream(self, token: str, message: str = "") -> None:
+    def _stream(self, token: str, message: str = "",
+                occupant: str = OCCUPANT_RACCOON) -> None:
         """Stream an SSE reply from llama.cpp and commit clean text."""
-        wake_note = self._take_wake_shape_note()
+        wake_note = self._take_wake_shape_note(occupant)
+        presence = self._take_presence_note() if occupant == OCCUPANT_RACCOON else ""
+        base = self._base_for(occupant)
         with self._lock:
-            snapshot = [{"role": "system", "content": self._build_system_content(message, wake_note)}]
-            snapshot.extend(self._history)
-        # Growth is surfaced once, on the first input after the room deepened
-        # (the memory-block build above already forced any re-embedding, so
-        # the note is honest: the space truly did widen).
+            window = list(self._history)
+            snapshot = [{"role": "system",
+                         "content": self._build_system_content(
+                             message, wake_note, occupant, presence,
+                             visible=_window_text(window))}]
+            snapshot.extend(window)
+        # Growth is surfaced, once per present occupant, on the first input
+        # after the room deepened (the memory-block build above already forced
+        # any re-embedding, so the note is honest: the space truly did widen).
         if self._memory is not None:
             try:
-                growth_note = self._memory.growth_note()
+                growth_note = self._memory.growth_note(occupant)
                 if growth_note and snapshot:
                     snapshot[0]["content"] += "\n\n" + growth_note
             except Exception as exc:  # noqa: BLE001
                 log.warning("Growth note failed: %s", exc)
-        model = self._auto_model()
-        url = f"{LLM_BASE}/v1/chat/completions"
-        log.info("Streaming  token=%s  model=%s  msgs=%d",
-                 token[:8], model, len(snapshot))
+        model = self._auto_model(base)
+        url = f"{base}/v1/chat/completions"
+        log.info("Streaming  occupant=%s  token=%s  model=%s  msgs=%d",
+                 occupant, token[:8], model, len(snapshot))
         try:
             with requests.post(
                 url,
@@ -429,19 +670,21 @@ class BubbleDaemon:
                 stream=True,
             ) as resp:
                 resp.raise_for_status()
-                self._consume_sse(resp, token, message)
+                self._consume_sse(resp, token, message, occupant)
         except ChunkedEncodingError as exc:
             log.info("Stream closed without terminator (normal for this server)  token=%s  chars=%d",
                      token[:8], len(self._history))
         except RequestException as exc:
-            log.error("stream request failed  token=%s  %s", token[:8], exc)
-            GLib.idle_add(self.StreamError, token, str(exc))
-            GLib.idle_add(self.StreamDone, token)
+            log.error("stream request failed  occupant=%s  token=%s  %s",
+                      occupant, token[:8], exc)
+            GLib.idle_add(self.StreamError, occupant, token, str(exc))
+            GLib.idle_add(self.StreamDone, occupant, token)
             return
         GLib.idle_add(self._set_status, "hanging-out", "idle")
-        GLib.idle_add(self.StreamDone, token)
+        GLib.idle_add(self.StreamDone, occupant, token)
 
-    def _consume_sse(self, resp, token: str, user_message: str = "") -> None:
+    def _consume_sse(self, resp, token: str, user_message: str = "",
+                     occupant: str = OCCUPANT_RACCOON) -> None:
         """Consume SSE `choices[].delta.*` deltas from the server."""
         answer_text = ""
         content_buffer = ""
@@ -464,37 +707,82 @@ class BubbleDaemon:
                 reasoning = delta.get("reasoning_content")
                 if content:
                     content_buffer += content
-                    GLib.idle_add(self.StreamChunk, token, content)
+                    GLib.idle_add(self.StreamChunk, occupant, token, content)
                     answer_text += content
                 if reasoning:
                     # reasoning_content streams to the think panel but is NOT
                     # saved to context — sending it back causes runaway repetition.
-                    GLib.idle_add(self.StreamThink, token, reasoning)
+                    GLib.idle_add(self.StreamThink, occupant, token, reasoning)
         except ChunkedEncodingError:
             pass
 
         clean_text = answer_text.strip()
         with self._lock:
-            self._history.append({"role": "assistant", "content": clean_text})
+            self._history.append({"role": "assistant", "content": clean_text,
+                                  "speaker": occupant})
             self._last_assistant_time = time.monotonic()
             self._trim_history()
             self._save_history()
 
-        self._index_exchange(user_message, clean_text)
+        self._index_exchange(user_message, clean_text, occupant, token)
         self._check_sleep()
 
         GLib.idle_add(self._set_status, "chatting", "streaming response")
-        log.info("Stream done  token=%s  answer_chars=%d", token[:8], len(clean_text))
+        log.info("Stream done  occupant=%s  token=%s  answer_chars=%d",
+                 occupant, token[:8], len(clean_text))
 
-    def _index_exchange(self, user_message: str, answer: str) -> None:
+    def _index_exchange(self, user_message: str, answer: str,
+                        occupant: str = OCCUPANT_RACCOON,
+                        exchange_id: str = "") -> None:
         """Queue the finished exchange into memory (embeddings are the key)."""
         if self._memory is None:
             return
         try:
-            self._memory.add_experience(user_message or "", source="user")
-            self._memory.add_experience(answer or "", source="mind")
+            # The human said it once. Every occupant answering the same turn
+            # must not write it down again: one utterance encoded once per mind
+            # is the same event stored N times, and the room reads the copies
+            # back as a series of separate things that happened.
+            if user_message and self._index_user_turn_once(exchange_id,
+                                                           user_message):
+                self._memory.add_experience(user_message, source="user",
+                                            exchange_id=exchange_id)
+            # A mind that repeats the previous mind word for word has not said
+            # anything: storing it would carve the echo into the record twice,
+            # once per speaker, and the room would keep hearing it back.
+            if self._is_verbatim_echo(answer):
+                log.info("Not indexed: %s repeated the last answer word for "
+                         "word (nothing new to remember)", occupant)
+                return
+            self._memory.add_experience(answer or "", source="mind",
+                                       owner=occupant, exchange_id=exchange_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("Memory indexing failed: %s", exc)
+
+    def _index_user_turn_once(self, exchange_id: str, message: str) -> bool:
+        """True for the first occupant to finish this turn; False after that.
+
+        One human utterance is one event. Encoding it again for each mind that
+        answers gives the store several timestamps for a single thing said, and
+        a mind that later reads two of those copies meets the same moment twice.
+        """
+        if not exchange_id:
+            return True
+        with self._lock:
+            if exchange_id in self._indexed_user_turns:
+                return False
+            self._indexed_user_turns.add(exchange_id)
+        return True
+
+    def _is_verbatim_echo(self, answer: str) -> bool:
+        """True when this answer is the previous occupant's answer, unchanged."""
+        text = _norm_speech(answer)
+        if not text:
+            return False
+        with self._lock:
+            for msg in reversed(self._history):
+                if msg.get("role") == "assistant":
+                    return _norm_speech(msg.get("content", "")) == text
+        return False
 
     # ------------------------------------------------------------------
     # Dream / slow-wave — context-pressure driven (a child does not know
@@ -516,20 +804,31 @@ class BubbleDaemon:
             self._start_dream(reason="context-pressure")
 
     def _maybe_first_dream(self) -> None:
-        """The first thing the occupant model experiences: a dream of its
-        first memory. Only on a store that has never slept before."""
+        """The first thing each occupant experiences: a dream of its first
+        memory. Only on a store that occupant has never slept before."""
         if self._memory is None:
             return
+        founders = []
         try:
-            if self._memory.has_dream():
-                return
-            if not self._memory.instruction_texts():
-                return
+            for owner in self._present_occupants():
+                if (self._memory.instruction_texts(owner)
+                        and not self._memory.has_dream(owner)):
+                    founders.append(owner)
         except Exception as exc:  # noqa: BLE001
             log.warning("First-dream check failed: %s", exc)
             return
-        log.info("First dream: dreaming the initial first memory")
+        if not founders:
+            return
+        log.info("First dream: dreaming the initial first memory (%s)", founders)
         self._start_dream(reason="first-memory")
+
+    def _present_occupants(self) -> list[str]:
+        """Occupants to speak: the resident always; the second only once it
+        has been born with a letter and its brain is wired."""
+        owners = [OCCUPANT_RACCOON]
+        if self._second_present and self._llm2_base:
+            owners.append(self._occupant2_id)
+        return owners
 
     def _sleep_info(self) -> dict:
         return {
@@ -554,23 +853,37 @@ class BubbleDaemon:
         ).start()
 
     def _dream_pass(self, reason: str) -> None:
-        """The dream itself: replay the context window, compress it, embed it.
+        """The dream: let each occupant compress the record for itself.
 
-        Same concept as context compaction in a coding harness — direct replay
-        of the window, keeping what is interesting / newly learned / repeated,
-        dropping the rest. Wake with a fresh window that opens on the summary
-        the model just wrote; identity is re-grounded from RAG afterwards.
+        The log stays verbatim in the store; this is the one place it is read
+        raw, because this is the place it becomes something else. What the
+        model writes here is what it will wake holding, and the record it
+        compacts is not required to be accurate — it is required to be the
+        model's own. What it drops, it drops.
+
+        Still to come, and the largest piece of this: read the *full* log
+        rather than the window, train against it, and reset on sleep.
         """
-        try:
-            summary = self._replay_and_compress(reason)
-        except Exception as exc:  # noqa: BLE001
-            log.error("Dream failed  reason=%s  %s", reason, exc)
-            with self._lock:
-                self._sleeping = False
-            GLib.idle_add(self._set_status, "hanging-out", "dream failed")
-            return
-        if not summary.strip():
-            log.warning("Dream produced nothing  reason=%s", reason)
+        with self._lock:
+            snapshot = list(self._history)
+        summaries: dict[str, str] = {}
+        for owner in self._present_occupants():
+            # A mind that has never dreamed dreams its first memory first,
+            # whatever the room's reason for sleeping was.
+            why = reason
+            try:
+                if (self._memory is not None
+                        and not self._memory.has_dream(owner)):
+                    why = "first-memory"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Dream check failed for %s: %s", owner, exc)
+            try:
+                s = self._replay_and_compress(why, owner, snapshot)
+                if (s or "").strip():
+                    summaries[owner] = s.strip()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Dream failed for %s  reason=%s  %s", owner, why, exc)
+        if not summaries:
             with self._lock:
                 self._sleeping = False
             GLib.idle_add(self._set_status, "hanging-out", "empty dream")
@@ -579,32 +892,36 @@ class BubbleDaemon:
         with self._lock:
             self._last_dream_time = time.monotonic()
             self._dream_count += 1
-            self._dream_summary = summary
+            keep = max(0, self._sleep_keep_turns)
             # Sleep is the only event that clears the conversation — and even
             # then a few closing turns stay at the foot of the fresh window.
-            keep = max(0, self._sleep_keep_turns)
             self._history = self._history[-keep:] if keep else []
             self._sleeping = False
             self._save_history()
-        try:
-            if self._memory is not None:
-                self._memory.add_dream(summary)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Dream embed/storage failed: %s", exc)
+        for owner, s in summaries.items():
+            self._dream_summaries[owner] = s
+            if owner == OCCUPANT_RACCOON:
+                self._dream_summary = s
+        for owner, s in summaries.items():
+            try:
+                if self._memory is not None:
+                    self._memory.add_dream(s, owner=owner)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Dream embed/storage failed: %s", exc)
 
-        # One-shot waking awareness: surface the memory space's shape to the
-        # model on its first input after waking. The shape is one thing before
+        # One-shot waking awareness per occupant: the shape is one thing before
         # sleep; selection and embedding happen while asleep; the context is
         # wiped. The mismatch between the remembered shape and the now-shape
         # is where dreams really live.
-        self._stamp_wake_shape(reason)
+        for owner in summaries:
+            self._stamp_wake_shape(reason, owner)
 
-        log.info("Dream done  reason=%s  summary_chars=%d  "
-                 "context -> fresh (kept %d turns)",
-                 reason, len(summary), keep)
+        log.info("Dream done  reason=%s  owners=%s  context -> fresh (kept %d turns)",
+                 reason, list(summaries), keep)
         GLib.idle_add(self._set_status, "waking", "fresh context, only the dream")
 
-    def _stamp_wake_shape(self, reason: str) -> None:
+    def _stamp_wake_shape(self, reason: str,
+                          owner: str = OCCUPANT_RACCOON) -> None:
         """Snapshot the freshly-embedded memory space for the first waking input.
 
         Runs on the mind-dream thread (never the GLib main loop). The shape is
@@ -616,30 +933,37 @@ class BubbleDaemon:
                 return
             note = self._memory.wake_shape_note()
             with self._lock:
-                self._wake_shape_note = note
+                self._wake_shape_notes[owner] = note
+                if owner == OCCUPANT_RACCOON:
+                    self._wake_shape_note = note
         except Exception as exc:  # noqa: BLE001
             log.warning("Wake shape capture failed: %s", exc)
 
-    def _take_wake_shape_note(self) -> Optional[str]:
+    def _take_wake_shape_note(self, owner: str = OCCUPANT_RACCOON) -> Optional[str]:
         """Return and clear the one-shot waking shape note (if any)."""
         with self._lock:
-            note = self._wake_shape_note
-            self._wake_shape_note = None
+            note = self._wake_shape_notes.pop(owner, None)
+            if owner == OCCUPANT_RACCOON:
+                self._wake_shape_note = None
         return note
 
-    def _replay_and_compress(self, reason: str) -> str:
+    def _replay_and_compress(self, reason: str,
+                             owner: str = OCCUPANT_RACCOON,
+                             replay: Optional[str] = None) -> str:
         """Non-streaming dream: model compresses its own context window."""
-        with self._lock:
-            if reason == "first-memory":
-                # The very first experience: dream the initial seeded memory.
-                blocks = self._memory.build_memory_block(top_k=64)
-                replay = blocks or "(no first memory yet)"
-            else:
-                replay = self._render_history()
-        snapshot = [{"role": "user", "content": self._dream_prompt(reason, replay)}]
-        model = self._auto_model()
-        log.info("Dreaming  reason=%s  model=%s", reason, model)
-        url = f"{LLM_BASE}/v1/chat/completions"
+        if replay is None:
+            replay = self._render_history()
+        if reason == "first-memory":
+            # The very first experience: dream the initial seeded memory.
+            blocks = self._memory.build_memory_block(
+                top_k=64, owner=owner, include_log=True)
+            replay = blocks or "(no first memory yet)"
+        snapshot = [{"role": "user",
+                     "content": self._dream_prompt(reason, replay, owner)}]
+        base = self._base_for(owner)
+        model = self._auto_model(base)
+        log.info("Dreaming  occupant=%s  reason=%s  model=%s", owner, reason, model)
+        url = f"{base}/v1/chat/completions"
         # Qwen3-style models spend tokens on reasoning_content before content;
         # give the dream enough room so content is actually emitted.
         with requests.post(
@@ -689,10 +1013,12 @@ class BubbleDaemon:
         for m in history:
             role = m.get("role", "unknown")
             content = m.get("content", "")
-            lines.append(f"[{role}] {content}")
+            who = m.get("speaker") or ("user" if role == "user" else role)
+            lines.append(f"[{who}] {content}")
         return "\n\n".join(lines)
 
-    def _dream_prompt(self, reason: str, replay: str) -> str:
+    def _dream_prompt(self, reason: str, replay: str,
+                      owner: str = OCCUPANT_RACCOON) -> str:
         now_str = datetime.datetime.now().strftime("%A, %B %-d %Y %H:%M")
         if reason == "first-memory":
             return (
@@ -739,20 +1065,35 @@ class BubbleDaemon:
                 self._last_nudge_time = now
                 self._nudge_count += 1
             token = str(now)
-            GLib.idle_add(self.NudgeStart, token, "idle", int(idle_min))
+            present = self._present_occupants()
+            if not present:
+                continue
+            # Alternate which occupant gets to initiate; tie it to how many
+            # nudges have happened so it rotates naturally.
+            occupant = present[self._nudge_count % len(present)]
+            GLib.idle_add(self.NudgeStart, occupant, token, "idle", int(idle_min))
             threading.Thread(
-                target=self._clock_tick, args=(token, int(idle_min)), daemon=True,
-                name="mind-clock-tick",
+                target=self._clock_tick, args=(token, int(idle_min), occupant),
+                daemon=True, name="mind-clock-tick",
             ).start()
-            log.info("Clock tick fired  idle=%.1fm  token=%s", idle_min, token[:8])
+            log.info("Clock tick fired  occupant=%s  idle=%.1fm  token=%s",
+                     occupant, idle_min, token[:8])
 
-    def _clock_tick(self, token: str, idle_minutes: int) -> None:
-        """Streaming tick: the mind orients itself, speaks if it chooses."""
+    def _clock_tick(self, token: str, idle_minutes: int,
+                    occupant: str = OCCUPANT_RACCOON) -> None:
+        """Streaming tick: the occupant orients itself, speaks if it chooses."""
+        base = self._base_for(occupant)
         with self._lock:
-            snapshot = [{"role": "system", "content": self._build_system_content()}]
-            snapshot.extend(self._history)
-        model = self._auto_model()
-        url = f"{LLM_BASE}/v1/chat/completions"
+            window = list(self._history)
+            snapshot = [{"role": "system",
+                         "content": self._build_system_content(
+                             "", self._take_wake_shape_note(occupant),
+                             occupant,
+                             self._take_presence_note() if occupant == OCCUPANT_RACCOON else "",
+                             visible=_window_text(window))}]
+            snapshot.extend(window)
+        model = self._auto_model(base)
+        url = f"{base}/v1/chat/completions"
         now_str = datetime.datetime.now().strftime("%A, %B %-d %Y %H:%M")
         idle_note = (
             f"The user has been quiet for {idle_minutes} minute"
@@ -788,31 +1129,46 @@ class BubbleDaemon:
                 resp.raise_for_status()
                 clean_text = self._consume_sse_text(resp)
         except RequestException as exc:
-            log.error("Clock tick error  token=%s  %s", token[:8], exc)
+            log.error("Clock tick error  occupant=%s  token=%s  %s",
+                      occupant, token[:8], exc)
             return
 
         if not clean_text:
             return
         with self._lock:
-            self._history.append({"role": "assistant", "content": clean_text})
+            self._history.append({"role": "assistant", "content": clean_text,
+                                  "speaker": occupant})
             self._last_assistant_time = time.monotonic()
             self._trim_history()
-        self._index_exchange("", clean_text)
+        self._index_exchange("", clean_text, occupant, token)
         self._check_sleep()
-        log.info("Clock tick text (%d chars) — surfacing  token=%s",
-                 len(clean_text), token[:8])
-        GLib.idle_add(self.StreamChunk, token, clean_text)
-        GLib.idle_add(self.StreamDone, token)
+        log.info("Clock tick text (%d chars) — surfacing  occupant=%s  token=%s",
+                 len(clean_text), occupant, token[:8])
+        GLib.idle_add(self.StreamChunk, occupant, token, clean_text)
+        GLib.idle_add(self.StreamDone, occupant, token)
+        GLib.idle_add(self.StreamDone, "", token)
 
     # ------------------------------------------------------------------
     # The MX: system-prompt framing + live context/telemetry
     # ------------------------------------------------------------------
-    def _build_system_content(self, message: str = "", wake_note: Optional[str] = None) -> str:
+    def _build_system_content(self, message: str = "",
+                              wake_note: Optional[str] = None,
+                              occupant: str = OCCUPANT_RACCOON,
+                              presence_note: Optional[str] = None,
+                              visible: str = "") -> str:
         parts = []
-        if self._system_prompt:
-            parts.append(self._system_prompt)
+        if occupant == OCCUPANT_RACCOON:
+            if self._system_prompt:
+                parts.append(self._system_prompt)
+        else:
+            if self._system_prompt_second:
+                parts.append(self._system_prompt_second)
         with self._lock:
-            dream_summary = self._dream_summary
+            dream_summary = self._dream_summaries.get(occupant)
+            if not dream_summary and occupant == OCCUPANT_RACCOON:
+                dream_summary = self._dream_summary
+            elif dream_summary and occupant == OCCUPANT_RACCOON:
+                self._dream_summary = dream_summary
         if dream_summary:
             parts.append(
                 "--- Dream recall ---\n"
@@ -824,10 +1180,14 @@ class BubbleDaemon:
         if wake_note:
             # One-shot, consumed only by the first input after waking.
             parts.append(wake_note)
+        if presence_note:
+            # One-shot: first interaction after another presence arrived.
+            parts.append(presence_note)
         mem_block = None
         if self._memory is not None:
             try:
-                mem_block = self._memory.build_memory_block(message)
+                mem_block = self._memory.build_memory_block(
+                    message, owner=occupant, visible=visible)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Memory block failed: %s", exc)
         if mem_block:
@@ -848,6 +1208,9 @@ class BubbleDaemon:
                     lines.append(shape_line)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Shape line failed: %s", exc)
+        if self._second_present and self._llm2_base:
+            lines.append("Room: another mind shares this room. Your words are "
+                         "read by it, and its words are read by you.")
         if tel.get("dream_count", 0) > 0:
             lines.append(f"Dreams slept: {tel['dream_count']} "
                          f"(pressure threshold {int(tel['sleep_ctx_pct'])}%).")

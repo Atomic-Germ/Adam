@@ -5,7 +5,7 @@ After=network.target
 
 [Service]
 Type=exec
-ExecStart=llama-server --load-mode streaming --gpu-pill --no-mmproj --spec-type none -c 48000 -gm 1 -gi -gpm 0.01 -gx --port 9999
+ExecStart=llama-server --load-mode streaming --gpu-pill --spec-type none -c 24000 -gm 3 -gi -gpm 0.45 -gx --port 9999 -hf crucible-labs/Qwen3.6-35B-A3B-REAP-48-v2-GGUF:V2
 Restart=on-failure
 StandardError=journal
 

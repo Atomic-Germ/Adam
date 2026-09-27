@@ -8,11 +8,23 @@ Cathedral-style record/embedding store, seeding, and relevance selection.
 import math
 import json
 import threading
+import time
 
 import pytest
 from conftest import bd
 
 import mind_memory
+
+
+def _settled(mem, seconds: int = 100000) -> None:
+    """Age every record past RECENT_HOLDOFF.
+
+    A trace written this second is still happening, not yet something that can
+    come to mind; tests about recall age their fixtures rather than faking time.
+    """
+    now = int(time.time())
+    for rec in mem._records:
+        rec["created_at"] = now - seconds
 
 
 @pytest.fixture
@@ -125,6 +137,7 @@ class TestStore:
         m = mind_memory.MindMemory()
         try:
             m.add_chunked("the raccoon with the cookie", source="user")
+            _settled(m)
             top = m.select("raccoon cookie", top_k=1)
             assert top and "raccoon" in top[0].get("text", "")
             assert m.stats()["backend"] == "off"
@@ -137,16 +150,22 @@ class TestSelection:
         mem.add_chunked("the user prefers quiet evenings alone", source="user")
         mem.add_chunked("the model likes crisp summaries", source="mind")
         mem.save()
+        _settled(mem)
         top = mem.select("what does the user prefer?", top_k=1)
         assert len(top) >= 1
         assert "quiet evenings" in top[0].get("text", "")
 
     def test_build_memory_block(self, mem):
+        # The waking mind is not shown the log; the log-reading path is.
         mem.add_chunked("the user prefers quiet evenings alone", source="user")
-        block = mem.build_memory_block("user preferences")
-        assert block is not None
-        assert block.startswith("--- Memory ---")
-        assert "[user] the user prefers" in block
+        _settled(mem)
+        mem.add_instruction("you are the raccoon in this room", owner="raccoon")
+        awake = mem.build_memory_block("user preferences")
+        assert awake.startswith("--- Memory ---")
+        assert "raccoon in this room" in awake      # its own ground
+        assert "quiet evenings" not in awake        # not the log
+        log_reader = mem.build_memory_block("user preferences", include_log=True)
+        assert "[user] the user prefers" in log_reader
 
     def test_build_memory_block_empty(self, mem):
         assert mem.build_memory_block("anything") is None
@@ -187,6 +206,7 @@ class TestFuzzyRecall:
         for i in range(10):
             mem.add_chunked(f"unrelated footnote text number {i}", source="mind")
         mem.save()
+        _settled(mem)
         top = mem.select("what does the user prefer?", top_k=6)
         assert any("quiet evenings" in r["text"] for r in top)
         assert len(top) >= 1
@@ -200,6 +220,7 @@ class TestFuzzyRecall:
         for i in range(10):
             mem.add_chunked(f"unrelated footnote text number {i}", source="mind")
         mem.save()
+        _settled(mem)
         top = mem.select("what does the user prefer?", top_k=6)
         assert all(
             "quiet" in r["text"] or "prefer" in r["text"] for r in top
@@ -212,12 +233,14 @@ class TestFuzzyRecall:
         for i in range(12):
             mem.add_chunked(f"geometry shape number {i}", source="user")
         mem.save()
+        _settled(mem)
         strict = [r["id"] for r in mem.select("geometry", top_k=6)]
         assert len(strict) == 6
 
     def test_build_memory_block_has_no_selection_metadata(self, mem):
         mem.add_chunked("the user prefers quiet evenings alone", source="user")
-        block = mem.build_memory_block("user preferences")
+        _settled(mem)
+        block = mem.build_memory_block("user preferences", include_log=True)
         assert "Showing" not in block
         assert "relevance-filtered" not in block
         assert "of 1 memory nodes" not in block
@@ -371,9 +394,14 @@ class TestDaemonMemory:
 
     def test_system_content_includes_memory_block(self, daemon):
         daemon._memory.add_chunked("the raccoon with the cookie", source="user")
+        daemon._memory.add_instruction("you are the raccoon in this room",
+                                       owner="raccoon")
+        _settled(daemon._memory)
         content = daemon._build_system_content("what about the cookie?")
         assert "--- Memory ---" in content
-        assert "raccoon" in content
+        assert "raccoon in this room" in content
+        # The conversation's own words are not handed back as memory.
+        assert "with the cookie" not in content
 
     def test_system_content_counts(self, daemon):
         content = daemon._build_system_content("")
@@ -433,6 +461,8 @@ class TestDaemonMemory:
     def test_system_content_keeps_only_one_wake_note(self, daemon):
         for i in range(4):
             daemon._memory.add_chunked(f"a single thought {i}", source="user")
+        daemon._memory.add_instruction("you are the raccoon in this room",
+                                       owner="raccoon")
         daemon._memory.shape_report()  # clock-tick thread, per design
         daemon._stamp_wake_shape("context-pressure")
         note = daemon._take_wake_shape_note()

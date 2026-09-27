@@ -1,0 +1,14 @@
+[Unit]
+Description=Mind Llama 2 — LLM service for the Mind body
+Before=mind.service
+After=mind-llama.service
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=llama-server --gpu-pill --no-mmproj --spec-type none -c 16000 -ngi -ngx --port 9998 -hf Atomic-Germ/Qwen3.8-9B-Distill-GGUF:Q8_0
+Restart=on-failure
+StandardError=journal
+
+[Install]
+WantedBy=default.target

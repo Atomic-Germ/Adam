@@ -13,6 +13,10 @@ import * as Main    from 'resource:///org/gnome/shell/ui/main.js';
 
 const SENDMESSAGE_TIMEOUT_MS = 30000;
 
+// The resident's name. A second occupant streams under its own name; the end
+// of a whole turn is signalled with an empty occupant.
+const OCCUPANT_MAIN = 'raccoon';
+
 // ---------------------------------------------------------------------------
 // D-Bus interface
 // ---------------------------------------------------------------------------
@@ -42,17 +46,21 @@ const DBUS_IFACE = `<node>
       <arg type='s' name='pong' direction='out'/>
     </method>
     <signal name='StreamChunk'>
+      <arg type='s' name='occupant'/>
       <arg type='s' name='token'/>
       <arg type='s' name='text'/>
     </signal>
     <signal name='StreamThink'>
+      <arg type='s' name='occupant'/>
       <arg type='s' name='token'/>
       <arg type='s' name='text'/>
     </signal>
     <signal name='StreamDone'>
+      <arg type='s' name='occupant'/>
       <arg type='s' name='token'/>
     </signal>
     <signal name='NudgeStart'>
+      <arg type='s' name='occupant'/>
       <arg type='s' name='token'/>
     </signal>
         <signal name='StatusChanged'>
@@ -60,6 +68,7 @@ const DBUS_IFACE = `<node>
             <arg type='s' name='detail'/>
         </signal>
     <signal name='StreamError'>
+      <arg type='s' name='occupant'/>
       <arg type='s' name='token'/>
       <arg type='s' name='error_msg'/>
     </signal>
@@ -80,10 +89,15 @@ export default class MindExtension extends Extension {
         this._settingsChanged = null;
         this._window          = null;
         this._streaming       = false;
+        this._turnActive      = false;   // a full turn (all occupants) in flight
         this._currentToken    = null;
-        this._streamLabel     = null;
+        this._streamLabel     = null;    // current occupant's answer label
+        this._streamLabels    = {};      // occupant -> answer label
+        this._streamSlots     = new Set();  // occupants with an open bubble
         this._thinkLabel      = null;
+        this._thinkLabels     = {};      // occupant -> think label
         this._thinkToggle     = null;
+        this._thinkToggles    = {};      // occupant -> think toggle
         this._statusLabel     = null;
         this._statusState     = 'hanging-out';
         this._streamWatchdogId = 0;
@@ -111,10 +125,15 @@ export default class MindExtension extends Extension {
         this._proxySigs    = [];
         this._proxy        = null;
         this._streaming    = false;
+        this._turnActive   = false;
         this._currentToken = null;
         this._streamLabel  = null;
+        this._streamLabels = {};
+        this._streamSlots  = new Set();
         this._thinkLabel   = null;
+        this._thinkLabels  = {};
         this._thinkToggle  = null;
+        this._thinkToggles = {};
         this._statusLabel  = null;
         this._statusState  = 'hanging-out';
         this._clearStreamWatchdog();
@@ -157,72 +176,51 @@ export default class MindExtension extends Extension {
                 // single 'g-signal' GObject signal — not individual methods.
                 this._proxySigs.push(
                     this._proxy.connect('g-signal', (_proxy, _sender, signalName, params) => {
-                        const unpacked = params.deepUnpack();
-                        const token    = unpacked[0];
+                        const unpacked  = params.deepUnpack();
+                        const occupant  = unpacked[0] ?? OCCUPANT_MAIN;
+                        const token     = unpacked[1];
+                        const isTurnEnd = occupant === '';   // all occupants spoke
 
                         if (signalName === 'StreamChunk') {
-                            const text = unpacked[1];
+                            const text = unpacked[2] ?? '';
                             if (token !== this._currentToken) return;
                             this._bumpStreamWatchdog(token);
-                            const cur = this._streamLabel?.get_text() ?? '';
-                            this._streamLabel?.set_text(cur + text);
+                            const cur = this._slotLabel(occupant)?.get_text() ?? '';
+                            this._slotLabel(occupant)?.set_text(cur + text);
                             this._scrollToBottom();
 
                         } else if (signalName === 'StreamThink') {
-                            const text = unpacked[1];
+                            const text = unpacked[2] ?? '';
                             if (token !== this._currentToken) return;
                             this._bumpStreamWatchdog(token);
-                            // Reveal the think section on the first token.
-                            if (this._thinkLabel && !this._thinkLabel.visible) {
-                                this._thinkLabel.show();
-                                this._thinkToggle?.show();
+                            const thinkLabel = this._slotThink(occupant);
+                            if (thinkLabel && !thinkLabel.visible) {
+                                thinkLabel.show();
+                                this._thinkToggles[occupant]?.show();
                             }
-                            const cur = this._thinkLabel?.get_text() ?? '';
-                            this._thinkLabel?.set_text(cur + text);
+                            const cur = thinkLabel?.get_text() ?? '';
+                            thinkLabel?.set_text(cur + text);
                             this._scrollToBottom();
 
                         } else if (signalName === 'StreamDone') {
                             if (token !== this._currentToken) return;
                             this._clearStreamWatchdog();
-                            // Format the completed answer with markdown → Pango
-                            // while we still hold a reference to the label.
-                            if (this._streamLabel) {
-                                const finalText = this._streamLabel.get_text().trim();
-                                if (!finalText) {
-                                    // Command-only replies can resolve to empty text.
-                                    // Remove the placeholder assistant bubble entirely.
-                                    const col = this._streamLabel.get_parent();
-                                    const row = col?.get_parent();
-                                    row?.destroy();
-                                } else {
-                                    const markup = this._markdownToPango(finalText);
-                                    try {
-                                        this._streamLabel.clutter_text.set_markup(markup);
-                                    } catch (_e) {
-                                        // Invalid markup — plain text already displayed.
-                                    }
-                                }
+                            if (isTurnEnd) {
+                                // Every occupant has spoken for this turn.
+                                this._resetStreamState();
+                                this._setInputEnabled(true);
+                                return;
                             }
-                            this._streaming    = false;
-                            this._currentToken = null;
-                            this._streamLabel  = null;
-                            this._thinkLabel   = null;
-                            this._thinkToggle  = null;
-                            this._setInputEnabled(true);
+                            this._finalizeSlot(occupant);
+                            this._streaming = true;  // more occupants may follow
+                            this._bumpStreamWatchdog(token);
 
                         } else if (signalName === 'NudgeStart') {
                             // Daemon is about to stream an unprompted message.
-                            // Show the bubble and create an empty assistant slot.
-                            if (this._streaming) return; // already busy
-                            this._streaming    = true;
-                            this._currentToken = token;
-                            this._showBubble();
-                            try {
-                                this._streamLabel = this._addMessage('assistant', '');
-                            } catch (e) {
-                                console.error(`[Mind] NudgeStart UI error: ${e}`);
-                            }
-                            this._setInputEnabled(false);
+                            // Show the bubble and create an empty slot for it.
+                            if (this._turnActive) return; // a turn is already in flight
+                            this._beginTurn(token, occupant);
+                            this._openSlot(occupant);
                             this._startStreamWatchdog(token);
 
                         } else if (signalName === 'StatusChanged') {
@@ -231,20 +229,21 @@ export default class MindExtension extends Extension {
                             this._setStatus(state, detail);
 
                         } else if (signalName === 'StreamError') {
-                            const errMsg = unpacked[1];
+                            const errMsg = unpacked[2] ?? '';
                             if (token !== this._currentToken) return;
-                            this._clearStreamWatchdog();
-                            this._streaming    = false;
-                            this._currentToken = null;
-                            if (this._streamLabel) {
-                                this._streamLabel.add_style_class_name('mind-error');
-                                this._streamLabel.set_text(`⚠ ${errMsg}`);
-                                this._streamLabel = null;
+                            if (isTurnEnd) {
+                                this._clearStreamWatchdog();
+                                this._resetStreamState();
+                                this._setInputEnabled(true);
+                                return;
                             }
-                            this._thinkLabel   = null;
-                            this._thinkToggle  = null;
-                            this._setInputEnabled(true);
-                            this._setStatus('hanging-out', 'idle');
+                            const label = this._slotLabel(occupant);
+                            if (label) {
+                                label.add_style_class_name('mind-error');
+                                label.set_text(`⚠ ${errMsg}`);
+                            }
+                            this._streaming = true;
+                            this._bumpStreamWatchdog(token);
                         }
                     }),
                 );
@@ -352,13 +351,9 @@ export default class MindExtension extends Extension {
         if (this._streamLabel) {
             this._streamLabel.add_style_class_name('mind-error');
             this._streamLabel.set_text('⚠ Daemon unavailable. Reconnecting…');
-            this._streamLabel = null;
         }
         this._clearStreamWatchdog();
-        this._streaming = false;
-        this._currentToken = null;
-        this._thinkLabel = null;
-        this._thinkToggle = null;
+        this._resetStreamState();
         this._setInputEnabled(true);
         this._setStatus('hanging-out', 'daemon reconnecting');
 
@@ -574,15 +569,14 @@ export default class MindExtension extends Extension {
         // Generate UUID synchronously before the D-Bus call so _currentToken
         // is already set when the first StreamChunk signal arrives.
         const token = GLib.uuid_string_random();
-        this._currentToken = token;
+        this._beginTurn(token, OCCUPANT_MAIN);
         this._startStreamWatchdog(token);
 
         // Add UI bubbles — kept separate from the proxy call so a UI error
         // can never prevent the message from reaching the daemon.
         try {
             this._addMessage('user', text);
-            this._streamLabel = this._addMessage('assistant', '');
-            this._scrollToBottom();
+            this._openSlot(OCCUPANT_MAIN);
         } catch (e) {
             console.error(`[Mind] UI error in _send: ${e}`);
         }
@@ -618,10 +612,8 @@ export default class MindExtension extends Extension {
                     if (this._streamLabel) {
                         this._streamLabel.add_style_class_name('mind-error');
                         this._streamLabel.set_text(`⚠ ${e.message}`);
-                        this._streamLabel = null;
                     }
-                    this._streaming    = false;
-                    this._currentToken = null;
+                    this._resetStreamState();
                     this._setInputEnabled(true);
                 }
             },
@@ -674,7 +666,17 @@ export default class MindExtension extends Extension {
                         const text = typeof m.content === 'string' ? m.content : '';
                         if (role !== 'user' && role !== 'assistant') continue;
                         if (!text.trim()) continue;
-                        this._addMessage(role, text);
+                        // assistant turns carry the occupant that spoke them.
+                        const who = m.speaker || OCCUPANT_MAIN;
+                        const label = this._addMessage(role, text, who);
+                        if (role === 'assistant') {
+                            // Same owner badge the live path stamps on finalize.
+                            const badge = `<span size="small" alpha="60%">${who}</span>\n`;
+                            try {
+                                label.clutter_text.set_markup(
+                                    badge + this._markdownToPango(text));
+                            } catch (_e) { /* plain text already displayed */ }
+                        }
                     }
                     this._scrollToBottom();
                 } catch (_e) {
@@ -705,6 +707,103 @@ export default class MindExtension extends Extension {
         this._statusLabel.add_style_class_name(`mind-status-${this._statusState}`);
     }
 
+    // -----------------------------------------------------------------------
+    // Per-occupant stream slots
+    //
+    // A turn is answered by several occupants in turn. Each owns its own
+    // bubble, its own think panel, and its own reason panel. The daemon marks
+    // the end of the whole turn with a StreamDone carrying an empty occupant.
+    // -----------------------------------------------------------------------
+    _beginTurn(token, occupant = OCCUPANT_MAIN) {
+        this._currentToken = token;
+        this._turnActive  = true;
+        this._streaming   = true;
+        this._streamLabels = {};
+        this._streamSlots  = new Set();
+        this._thinkLabels  = {};
+        this._thinkToggles = {};
+        this._streamLabel  = null;
+        this._thinkLabel   = null;
+        this._thinkToggle  = null;
+        this._setInputEnabled(false);
+    }
+
+    _openSlot(occupant) {
+        // Create (once) the bubble this occupant streams into.
+        if (this._streamSlots.has(occupant)) return;
+        try {
+            this._showBubble();
+            const label = this._addMessage('assistant', '', occupant);
+            this._streamLabels[occupant] = label;
+            this._streamLabel = label;
+            this._streamSlots.add(occupant);
+            this._scrollToBottom();
+        } catch (e) {
+            console.error(`[Mind] slot open error (${occupant}): ${e}`);
+        }
+    }
+
+    _slotLabel(occupant) {
+        if (this._streamSlots.has(occupant)) return this._streamLabels[occupant];
+        // A chunk from an occupant we were not told about yet: open its slot.
+        this._openSlot(occupant);
+        return this._streamLabels[occupant];
+    }
+
+    _slotThink(occupant) {
+        return this._thinkLabels[occupant];
+    }
+
+    _finalizeSlot(occupant) {
+        // Format the completed answer with markdown → Pango while we still
+        // hold a reference to the label. The owner badge is prepended last so
+        // the name cannot be swallowed by bold/italic transforms.
+        const label = this._streamLabels[occupant];
+        if (label) {
+            const finalText = label.get_text().trim();
+            if (!finalText) {
+                // Command-only replies can resolve to empty text.
+                // Remove the placeholder assistant bubble entirely.
+                const col  = label.get_parent();
+                const row  = col?.get_parent();
+                row?.destroy();
+            } else {
+                const badge = `<span size="small" alpha="60%">${occupant}</span>\n`;
+                const markup = badge + this._markdownToPango(finalText);
+                try {
+                    label.clutter_text.set_markup(markup);
+                } catch (_e) {
+                    // Invalid markup — plain text already displayed.
+                }
+            }
+            delete this._streamLabels[occupant];
+            this._streamSlots.delete(occupant);
+            delete this._thinkLabels[occupant];
+            delete this._thinkToggles[occupant];
+        }
+        this._streamLabel = this._streamLabels[this._lastOccupant()] ?? null;
+        this._thinkLabel  = this._thinkLabels[this._lastOccupant()] ?? null;
+        this._thinkToggle = this._thinkToggles[this._lastOccupant()] ?? null;
+    }
+
+    _lastOccupant() {
+        const keys = [...this._streamSlots];
+        return keys.length ? keys[keys.length - 1] : OCCUPANT_MAIN;
+    }
+
+    _resetStreamState() {
+        this._streaming    = false;
+        this._turnActive   = false;
+        this._currentToken = null;
+        this._streamLabel  = null;
+        this._streamLabels = {};
+        this._streamSlots  = new Set();
+        this._thinkLabel   = null;
+        this._thinkLabels  = {};
+        this._thinkToggle  = null;
+        this._thinkToggles = {};
+    }
+
     _startStreamWatchdog(token) {
         this._clearStreamWatchdog();
         this._streamWatchdogId = GLib.timeout_add_seconds(
@@ -719,11 +818,7 @@ export default class MindExtension extends Extension {
                     this._streamLabel.add_style_class_name('mind-error');
                     this._streamLabel.set_text('⚠ Response stalled. You can send another message.');
                 }
-                this._streaming = false;
-                this._currentToken = null;
-                this._streamLabel = null;
-                this._thinkLabel = null;
-                this._thinkToggle = null;
+                this._resetStreamState();
                 this._setInputEnabled(true);
                 this._setStatus('hanging-out', 'idle');
                 this._streamWatchdogId = 0;
@@ -748,7 +843,7 @@ export default class MindExtension extends Extension {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
-    _addMessage(role, text) {
+    _addMessage(role, text, occupant = OCCUPANT_MAIN) {
         const isUser = role === 'user';
 
         const row = new St.BoxLayout({
@@ -827,8 +922,11 @@ export default class MindExtension extends Extension {
         row.add_child(col);
         this._msgBox.add_child(row);
 
-        // Expose to signal handler via instance fields.
-        // These are overwritten each time a new assistant message starts.
+        // Expose to signal handler via per-occupant maps.
+        // These are registered when the occupant's bubble is opened, and
+        // removed by _finalizeSlot when its answer is complete.
+        this._thinkToggles[occupant] = thinkToggle;
+        this._thinkLabels[occupant]  = thinkBody;
         this._thinkToggle = thinkToggle;
         this._thinkLabel  = thinkBody;
 

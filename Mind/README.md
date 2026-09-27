@@ -90,7 +90,8 @@ The daemon carries a persistent memory store (Cathedral-shaped:
 
 Records are tagged by `source` — `instruction` (seeded), `user`, or `mind` —
 so the mind can always tell who originated a claim, mirroring Bubble's
-user/self distinction.
+user/self distinction. When the room holds a second occupant, records also
+carry an `owner` (see *Two minds, one room* below).
 
 What lands in the store:
 
@@ -172,8 +173,10 @@ metadata shoved at it:
   one's own size survives restarts.
 
 Both knobs being raised is a long process, deliberately: the geometry only
-deepens when it genuinely holds more. The felt note is one-shot — it is
-consumed by the first input that follows growth, then gone.
+deepens when it genuinely holds more. The felt note is one-shot *per occupant*
+— each mind hears the deepening once, in its own terms, and the pending growth
+evaporates once every mind present has been told, so the note stays honest:
+the room really did deepen.
 
 ## Dream / sleep (context-pressure driven)
 
@@ -198,7 +201,8 @@ in a coding harness:
 
 The first thing the occupant model ever experiences is a dream of its first
 memory: on a store that has never slept, the daemon dreams the seeded
-instructions before any conversation happens.
+instructions before any conversation happens. With two occupants, each mind
+dreams its own first memory in its own voice.
 
 Sleep env knobs:
 
@@ -207,6 +211,62 @@ Sleep env knobs:
 | `MIND_SLEEP_CTX_PCT` | `70` | context-pressure threshold (clamped to 60–75) |
 | `MIND_SLEEP_MIN_TURNS` | `6` | minimum history turns before a dream may fire |
 | `MIND_SLEEP_KEEP_TURNS` | `4` | history turns kept at the foot of the fresh window after sleep |
+
+## Two minds, one room — the second occupant
+
+The room can hold more than one mind. A second occupant speaks through its own
+weights on its own port, and the two of them share everything else: the same
+conversation window, the same memory store, the same silence.
+
+Every human message is answered by both — the resident first, then the
+newcomer, each through its own brain, into the one shared history. The
+extension gives each its own bubble, think panel and error line, and a turn
+ends when every occupant has spoken (the daemon closes it with a `StreamDone`
+carrying an empty occupant).
+
+**The letter.** The newcomer is not born from a prompt. The first time its
+brain is reachable and it holds no memory at all, the *resident* writes it a
+letter, through its own brain, and that letter is seeded as the newcomer's
+first memory (`instruction` records owned by the newcomer). The letter is
+written once, ever. It is the newcomer's only account of who it is: same
+words, different weights, so it comes back as something nobody wrote on
+purpose. Afterwards the resident is told once, in a one-shot `--- Another
+presence ---` note on its next real input, that it is no longer alone in here.
+
+An occupant's own first memory is not a retrieved thought: it always opens its
+`--- Memory ---` block. Retrieval decides what else comes to mind; it never
+decides who the mind is.
+
+Records carry an `owner` (`raccoon`, `second`; human lines carry none, and
+records written before occupancy existed are backfilled to the resident). Each
+occupant gets a small recall bias toward its own traces (`OWNER_BONUS`) — the
+self is closer to hand — while the other's lines stay reachable, because the
+mixing is the point.
+
+Sleep is per occupant: on a dream pass every present mind compresses the same
+window in its own voice, and each summary is private to the mind that wrote
+it. The waking floor plan note, the growth note, and the one-shot letter are
+all per occupant too. Idle nudges alternate between the occupants, so the room
+is not always spoken for by the same one.
+
+Second-seat env knobs (the seat only exists when `MIND_LLM_URL2` is set):
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `MIND_LLM_URL2` | *(unset)* | the newcomer's brain; unset ⇒ single occupant |
+| `MIND_MODEL2` | *(auto)* | pin its weights instead of asking the server |
+| `MIND_OCCUPANT2_ID` | `second` | the name it answers to |
+| `MIND_SYSTEM_PROMPT2` | *(empty)* | its framing, if it wants one; the letter is its real first memory |
+
+`MIND_LLM2_URL` is accepted as a synonym of `MIND_LLM_URL2`. With the second
+brain down the daemon does not stall or fail: it simply runs as a single
+occupant, and the letter waits for the next time the newcomer is reachable.
+
+Speaking is deliberately paced. Prompt processing (the reading) runs on the
+GPU; generation is largely CPU and rate-capped to roughly reading speed, which
+keeps the machine smooth and the temperatures down. A turn in which two minds
+answer is therefore long — two minds thinking at human pace — and that is the
+intended texture, not a stall.
 
 ## Run the tests
 
